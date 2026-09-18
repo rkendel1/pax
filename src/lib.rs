@@ -4,8 +4,9 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Ecosystem {
     JavaScript,
@@ -24,6 +25,14 @@ struct Component {
     lockfiles: Vec<String>,
     evidence: Vec<EvidenceItem>,
     workspace_packages: Vec<String>,
+    dependency_sources: Vec<DependencySource>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencySource {
+    kind: String,
+    path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +70,13 @@ pub struct CliError {
 
 #[derive(Clone, Copy, Debug)]
 enum CommandName {
+    Run,
+    X,
+    Install,
+    Add,
+    Remove,
+    Exec,
+    Deploy,
     Info,
     Doctor,
     Deps,
@@ -69,7 +85,7 @@ enum CommandName {
     Lock,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum PackageManager {
     Npm,
@@ -79,6 +95,16 @@ enum PackageManager {
 }
 
 impl PackageManager {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "npm" => Some(Self::Npm),
+            "pnpm" => Some(Self::Pnpm),
+            "bun" => Some(Self::Bun),
+            "yarn" => Some(Self::Yarn),
+            _ => None,
+        }
+    }
+
     fn display_name(self) -> &'static str {
         match self {
             Self::Npm => "npm",
@@ -254,6 +280,63 @@ struct DetectedManager {
     selected_by: String,
 }
 
+#[derive(Clone, Debug)]
+struct RunCommand {
+    program: String,
+    args: Vec<String>,
+    working_directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExecutionPlan {
+    operation: String,
+    ecosystem: String,
+    tool: String,
+    runner: String,
+    command: Vec<String>,
+    evidence: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeployProvider {
+    Fly,
+    Vercel,
+    Netlify,
+}
+
+impl DeployProvider {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fly => "fly",
+            Self::Vercel => "vercel",
+            Self::Netlify => "netlify",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fly" | "flyctl" => Some(Self::Fly),
+            "vercel" => Some(Self::Vercel),
+            "netlify" => Some(Self::Netlify),
+            _ => None,
+        }
+    }
+
+    fn command(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Fly => ("fly", "deploy"),
+            Self::Vercel => ("vercel", "deploy"),
+            Self::Netlify => ("netlify", "deploy"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeploySelection {
+    provider: DeployProvider,
+    evidence: Vec<String>,
+}
+
 pub fn run<I, S>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -265,8 +348,126 @@ where
         exit_code: 1,
     })?;
 
+    if let CommandName::Exec = cli.command {
+        let (program, args) = cli.run_args.split_first().ok_or_else(|| CliError {
+            message: format!("pax exec requires a command\n\n{}", usage()),
+            exit_code: 2,
+        })?;
+        return dispatch_execution(
+            RunCommand {
+                program: program.clone(),
+                args: args.to_vec(),
+                working_directory: cwd,
+            },
+            cli.dry_run,
+            cli.json,
+        );
+    }
     let detection = detect_repository(&cwd)?;
+    if cli.tool.is_none()
+        && matches!(
+            cli.command,
+            CommandName::Run
+                | CommandName::X
+                | CommandName::Install
+                | CommandName::Add
+                | CommandName::Remove
+        )
+        && detection.package_json
+        && detection
+            .package_json_data
+            .as_ref()
+            .and_then(|data| data.package_manager_field.as_ref())
+            .is_none()
+        && detection
+            .lockfiles
+            .iter()
+            .filter_map(|lockfile| manager_from_lockfile(lockfile))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1
+    {
+        return Err(CliError {
+            message: format!(
+                "multiple JavaScript package managers detected: {}\nuse --tool npm, --tool pnpm, --tool yarn, or --tool bun",
+                detection.lockfiles.join(", ")
+            ),
+            exit_code: 2,
+        });
+    }
+    if let CommandName::Run = cli.command {
+        let command = build_run_command(&detection, &cli.run_args, cli.tool.as_deref())?;
+        return dispatch_execution(command, cli.dry_run, cli.json);
+    }
+    if let CommandName::X = cli.command {
+        let command = build_x_command(&detection, &cli.run_args, cli.tool.as_deref())?;
+        return dispatch_execution(command, cli.dry_run, cli.json);
+    }
+    if let CommandName::Install = cli.command {
+        if cli.run_args.is_empty() {
+            let commands = build_project_install_commands(&detection, cli.tool.as_deref())?;
+            return dispatch_project_install(commands, cli.dry_run, cli.json);
+        }
+        let command = build_install_command(&detection, &cli.run_args, cli.tool.as_deref())?;
+        return dispatch_execution(command, cli.dry_run, cli.json);
+    }
+    if matches!(cli.command, CommandName::Add | CommandName::Remove) {
+        let command = build_package_mutation_command(
+            &detection,
+            &cli.run_args,
+            cli.tool.as_deref(),
+            matches!(cli.command, CommandName::Add),
+        )?;
+        return dispatch_execution(command, cli.dry_run, cli.json);
+    }
+    if let CommandName::Deploy = cli.command {
+        let selection = select_deploy_provider(&detection, cli.tool.as_deref())?;
+        let (program, canonical) = selection.provider.command();
+        let mut command_args = vec![canonical.to_string()];
+        command_args.extend(cli.run_args.iter().cloned());
+        if cli.dry_run {
+            return Ok(format!(
+                "provider: {}\nevidence: {}\ncommand: {} {}",
+                selection.provider.name(),
+                selection.evidence.join(", "),
+                program,
+                command_args.join(" ")
+            ));
+        }
+        let command = RunCommand {
+            program: program.to_string(),
+            args: command_args,
+            working_directory: detection.root.clone(),
+        };
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+            .map_err(|error| CliError {
+                message: format!("failed to execute {}: {error}", command.program),
+                exit_code: 1,
+            })?;
+        return match status.code() {
+            Some(0) => Ok(String::new()),
+            Some(code) => Err(CliError {
+                message: String::new(),
+                exit_code: code.min(u8::MAX as i32) as u8,
+            }),
+            None => Err(CliError {
+                message: String::new(),
+                exit_code: 1,
+            }),
+        };
+    }
+
     let output = match cli.command {
+        CommandName::Run => unreachable!(),
+        CommandName::X => unreachable!(),
+        CommandName::Install => unreachable!(),
+        CommandName::Add => unreachable!(),
+        CommandName::Remove => unreachable!(),
+        CommandName::Exec => unreachable!(),
+        CommandName::Deploy => unreachable!(),
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
         CommandName::Deps => build_output("deps", detection, false),
@@ -288,6 +489,9 @@ where
 struct ParsedCli {
     command: CommandName,
     json: bool,
+    run_args: Vec<String>,
+    tool: Option<String>,
+    dry_run: bool,
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli, CliError>
@@ -302,14 +506,69 @@ where
 
     let json = args.iter().any(|arg| arg == "--json");
     args.retain(|arg| arg != "--json");
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    args.retain(|arg| arg != "--dry-run");
+    let tool = if let Some(index) = args.iter().position(|arg| arg == "--tool") {
+        if index + 1 >= args.len() {
+            return Err(CliError {
+                message: "pax --tool requires a provider".to_string(),
+                exit_code: 2,
+            });
+        }
+        args.remove(index);
+        Some(args.remove(index))
+    } else {
+        None
+    };
 
-    let command = match args.as_slice() {
-        [command] if command == "info" => CommandName::Info,
-        [command] if command == "doctor" => CommandName::Doctor,
-        [command] if command == "deps" => CommandName::Deps,
-        [command] if command == "scripts" => CommandName::Scripts,
-        [command] if command == "workspaces" => CommandName::Workspaces,
-        [command] if command == "lock" => CommandName::Lock,
+    let (command, run_args) = match args.as_slice() {
+        [command, target, rest @ ..] if command == "run" || command == "x" => {
+            if target.is_empty() {
+                return Err(CliError {
+                    message: format!("pax {command} requires a target\n\n{}", usage()),
+                    exit_code: 2,
+                });
+            }
+            (
+                if command == "run" {
+                    CommandName::Run
+                } else {
+                    CommandName::X
+                },
+                std::iter::once(target.clone())
+                    .chain(rest.iter().cloned())
+                    .collect(),
+            )
+        }
+        [command, rest @ ..] if command == "deploy" => (CommandName::Deploy, rest.to_vec()),
+        [command, rest @ ..] if command == "install" => (CommandName::Install, rest.to_vec()),
+        [command, rest @ ..] if command == "add" => (CommandName::Add, rest.to_vec()),
+        [command, rest @ ..] if command == "remove" => (CommandName::Remove, rest.to_vec()),
+        [command, rest @ ..] if command == "exec" => (CommandName::Exec, rest.to_vec()),
+        [command] if command == "info" => (CommandName::Info, Vec::new()),
+        [command] if command == "doctor" => (CommandName::Doctor, Vec::new()),
+        [command] if command == "deps" => (CommandName::Deps, Vec::new()),
+        [command] if command == "scripts" => (CommandName::Scripts, Vec::new()),
+        [command] if command == "workspaces" => (CommandName::Workspaces, Vec::new()),
+        [command] if command == "lock" => (CommandName::Lock, Vec::new()),
+        [command] if command == "run" => {
+            return Err(CliError {
+                message: format!("pax run requires a target\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
+        [command] if command == "x" => {
+            return Err(CliError {
+                message: format!("pax x requires a package\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
+        [command] if command == "deploy" => {
+            return Err(CliError {
+                message: format!("pax deploy requires a provider\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
         [] => {
             return Err(CliError {
                 message: usage(),
@@ -324,11 +583,655 @@ where
         }
     };
 
-    Ok(ParsedCli { command, json })
+    Ok(ParsedCli {
+        command,
+        json,
+        run_args,
+        tool,
+        dry_run,
+    })
 }
 
 fn usage() -> String {
-    "usage: pax [--json] <info|doctor|deps|scripts|workspaces|lock>".to_string()
+    "usage: pax [--json] [--dry-run] [--tool <tool>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock>"
+        .to_string()
+}
+
+fn select_deploy_provider(
+    detection: &RepositoryDetection,
+    requested: Option<&str>,
+) -> Result<DeploySelection, CliError> {
+    let candidates = [
+        (DeployProvider::Fly, "fly.toml"),
+        (DeployProvider::Vercel, "vercel.json"),
+        (DeployProvider::Vercel, ".vercel/project.json"),
+        (DeployProvider::Netlify, "netlify.toml"),
+    ];
+    let mut detected = Vec::new();
+    for (provider, evidence) in candidates {
+        if detection.root.join(evidence).is_file()
+            && !detected
+                .iter()
+                .any(|(found, _): &(DeployProvider, String)| *found == provider)
+        {
+            detected.push((provider, evidence.to_string()));
+        }
+    }
+    if let Some(requested) = requested {
+        let provider = DeployProvider::parse(requested).ok_or_else(|| CliError {
+            message: format!("unsupported deployment provider: {requested}"),
+            exit_code: 2,
+        })?;
+        let evidence = detected
+            .iter()
+            .filter(|(found, _)| *found == provider)
+            .map(|(_, evidence)| evidence.clone())
+            .collect();
+        return Ok(DeploySelection { provider, evidence });
+    }
+    match detected.as_slice() {
+        [(provider, evidence)] => Ok(DeploySelection {
+            provider: *provider,
+            evidence: vec![evidence.clone()],
+        }),
+        [] => Err(CliError {
+            message: "could not detect a deployment provider (use --tool <provider>)".to_string(),
+            exit_code: 1,
+        }),
+        _ => Err(CliError {
+            message: format!(
+                "ambiguous deployment providers: {}",
+                detected
+                    .iter()
+                    .map(|(provider, evidence)| format!("{} ({evidence})", provider.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            exit_code: 2,
+        }),
+    }
+}
+
+fn build_x_command(
+    detection: &RepositoryDetection,
+    run_args: &[String],
+    override_tool: Option<&str>,
+) -> Result<RunCommand, CliError> {
+    let package = run_args.first().ok_or_else(|| CliError {
+        message: format!("pax x requires a package\n\n{}", usage()),
+        exit_code: 2,
+    })?;
+    let mut args = run_args.to_vec();
+    if package == "install" {
+        return build_install_command(detection, &args[1..], override_tool);
+    }
+    let program = if let Some(tool) = override_tool {
+        match tool {
+            "npm" => "npx",
+            "pnpm" => {
+                args.insert(0, "dlx".to_string());
+                "pnpm"
+            }
+            "bun" => "bunx",
+            "yarn" => {
+                args.insert(0, "dlx".to_string());
+                "yarn"
+            }
+            "uv" => "uvx",
+            "pip" => "pipx",
+            _ => {
+                return Err(CliError {
+                    message: format!("unsupported package runner tool: {tool}"),
+                    exit_code: 2,
+                });
+            }
+        }
+    } else if let Some(manager) = detection.manager.as_ref() {
+        match manager.name {
+            PackageManager::Npm => "npx",
+            PackageManager::Pnpm => {
+                args.insert(0, "dlx".to_string());
+                "pnpm"
+            }
+
+            PackageManager::Bun => "bunx",
+            PackageManager::Yarn => {
+                args.insert(0, "dlx".to_string());
+                "yarn"
+            }
+        }
+    } else if let Some(component) = detection
+        .components
+        .iter()
+        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
+    {
+        match component.tool.as_deref() {
+            Some("uv") => "uvx",
+            Some("poetry" | "pdm" | "pip") => "pipx",
+            _ => {
+                return Err(CliError {
+                    message: "could not detect an authoritative package runner".to_string(),
+                    exit_code: 1,
+                });
+            }
+        }
+    } else {
+        return Err(CliError {
+            message: "could not detect an authoritative package runner".to_string(),
+            exit_code: 1,
+        });
+    };
+    let _ = package;
+    Ok(RunCommand {
+        program: program.to_string(),
+        args,
+        working_directory: detection.root.clone(),
+    })
+}
+
+fn build_install_command(
+    detection: &RepositoryDetection,
+    install_args: &[String],
+    override_tool: Option<&str>,
+) -> Result<RunCommand, CliError> {
+    if let Some(tool) = override_tool {
+        if !matches!(tool, "npm" | "pnpm" | "bun" | "yarn") {
+            return build_python_install_command(detection, install_args, tool);
+        }
+
+        let mut args = vec!["install".to_string()];
+        args.extend(install_args.iter().cloned());
+        return Ok(RunCommand {
+            program: tool.to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    fn build_python_install_command(
+        detection: &RepositoryDetection,
+        install_args: &[String],
+        tool: &str,
+    ) -> Result<RunCommand, CliError> {
+        let mut args = Vec::new();
+        let program = match tool {
+            "uv" => {
+                args.push("pip".to_string());
+                "uv"
+            }
+            "pip" => "pip",
+            "poetry" => "poetry",
+            "pdm" => "pdm",
+            _ => {
+                return Err(CliError {
+                    message: format!("unsupported package manager tool: {tool}"),
+                    exit_code: 2,
+                });
+            }
+        };
+        args.push("install".to_string());
+        args.extend(install_args.iter().cloned());
+        Ok(RunCommand {
+            program: program.to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        })
+    }
+    if let Some(manager) = detection.manager.as_ref() {
+        let mut args = vec!["install".to_string()];
+        args.extend(install_args.iter().cloned());
+        return Ok(RunCommand {
+            program: manager.name.display_name().to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    let component = detection
+        .components
+        .iter()
+        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
+        .ok_or_else(|| CliError {
+            message: "could not detect an authoritative package manager".to_string(),
+            exit_code: 1,
+        })?;
+    let mut args = Vec::new();
+    let program = match component.tool.as_deref() {
+        Some("uv") => {
+            args.push("pip".to_string());
+            "uv"
+        }
+        Some("poetry") => "poetry",
+        Some("pdm") => "pdm",
+        Some("pip") => "pip",
+        _ => {
+            return Err(CliError {
+                message: "could not detect an authoritative package manager".to_string(),
+                exit_code: 1,
+            });
+        }
+    };
+    args.push("install".to_string());
+    args.extend(install_args.iter().cloned());
+    Ok(RunCommand {
+        program: program.to_string(),
+        args,
+        working_directory: detection.root.clone(),
+    })
+}
+
+fn build_package_mutation_command(
+    detection: &RepositoryDetection,
+    args: &[String],
+    override_tool: Option<&str>,
+    add: bool,
+) -> Result<RunCommand, CliError> {
+    let package = args.first().ok_or_else(|| CliError {
+        message: format!(
+            "pax {} requires a package\n\n{}",
+            if add { "add" } else { "remove" },
+            usage()
+        ),
+        exit_code: 2,
+    })?;
+    let inferred_tool = detection.components.iter().find_map(|component| {
+        (component.path == "."
+            && matches!(component.ecosystem, Ecosystem::Python | Ecosystem::Rust))
+        .then_some(component.tool.as_deref())
+        .flatten()
+    });
+    let tool = override_tool
+        .or_else(|| {
+            detection
+                .manager
+                .as_ref()
+                .map(|manager| manager.name.display_name())
+        })
+        .or(inferred_tool)
+        .ok_or_else(|| CliError {
+            message: "could not determine an authoritative package tool; use --tool".to_string(),
+            exit_code: 1,
+        })?;
+    let mut command_args = args.to_vec();
+    let (program, operation) = match tool {
+        "npm" => ("npm", if add { "install" } else { "uninstall" }),
+        "pnpm" => ("pnpm", if add { "add" } else { "remove" }),
+        "yarn" => ("yarn", if add { "add" } else { "remove" }),
+        "bun" => ("bun", if add { "add" } else { "remove" }),
+        "uv" => ("uv", if add { "add" } else { "remove" }),
+        "cargo" => ("cargo", if add { "add" } else { "remove" }),
+        _ => {
+            return Err(CliError {
+                message: format!("unsupported canonical package operation for {tool}"),
+                exit_code: 1,
+            });
+        }
+    };
+    command_args.insert(0, operation.to_string());
+    let _ = package;
+    Ok(RunCommand {
+        program: program.to_string(),
+        args: command_args,
+        working_directory: detection.root.clone(),
+    })
+}
+
+fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<String, CliError> {
+    if dry_run {
+        let plan = execution_plan(&command);
+        return if json {
+            serde_json::to_string_pretty(&plan).map_err(|error| CliError {
+                message: format!("failed to serialize execution plan: {error}"),
+                exit_code: 1,
+            })
+        } else {
+            Ok(format!(
+                "Ecosystem:   {}\nTool:        {}\nOperation:   {}\nCommand:     {}",
+                plan.ecosystem,
+                plan.tool,
+                plan.operation,
+                plan.command.join(" ")
+            ))
+        };
+    }
+    let status = Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(&command.working_directory)
+        .status()
+        .map_err(|error| CliError {
+            message: format!("failed to execute {}: {error}", command.program),
+            exit_code: 1,
+        })?;
+    match status.code() {
+        Some(0) => Ok(String::new()),
+        Some(code) => Err(CliError {
+            message: String::new(),
+            exit_code: code.min(u8::MAX as i32) as u8,
+        }),
+        None => Err(CliError {
+            message: String::new(),
+            exit_code: 1,
+        }),
+    }
+}
+
+fn execution_plan(command: &RunCommand) -> ExecutionPlan {
+    let tool = match command.program.as_str() {
+        "npx" => "npm",
+        "pnpm" => "pnpm",
+        "bunx" => "bun",
+        "yarn" => "yarn",
+        "uvx" | "uv" => "uv",
+        "pipx" | "pip" => "pip",
+        "cargo" => "cargo",
+        "docker" => "docker",
+        other => other,
+    };
+    let operation = if matches!(command.args.first().map(String::as_str), Some("install")) {
+        "install"
+    } else if matches!(
+        command.args.first().map(String::as_str),
+        Some("add" | "remove" | "uninstall")
+    ) {
+        command.args.first().unwrap()
+    } else if command.args.first().map(String::as_str) == Some("run") {
+        "task"
+    } else if command.program == "npx"
+        || command.program == "bunx"
+        || command.program == "uvx"
+        || (command.program == "pnpm" && command.args.first().map(String::as_str) == Some("dlx"))
+        || (command.program == "yarn" && command.args.first().map(String::as_str) == Some("dlx"))
+    {
+        "package-run"
+    } else {
+        "exec"
+    };
+    let mut evidence = Vec::new();
+    if command.working_directory.join("package.json").is_file() {
+        if let Ok(contents) = fs::read_to_string(command.working_directory.join("package.json"))
+            && contents.contains("\"packageManager\"")
+        {
+            evidence.push("package.json#packageManager".to_string());
+        }
+        for lockfile in [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+        ] {
+            if command.working_directory.join(lockfile).is_file() {
+                evidence.push(lockfile.to_string());
+            }
+        }
+    }
+    for source in [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "uv.lock",
+        "poetry.lock",
+        "pdm.lock",
+        "pyproject.toml",
+    ] {
+        if command.working_directory.join(source).is_file() {
+            evidence.push(source.to_string());
+        }
+    }
+    ExecutionPlan {
+        operation: operation.to_string(),
+        ecosystem: if tool == "cargo" {
+            "rust"
+        } else if matches!(tool, "uv" | "pip") {
+            "python"
+        } else if tool == "docker" {
+            "docker"
+        } else {
+            "javascript"
+        }
+        .to_string(),
+        tool: tool.to_string(),
+        runner: if command.program == "pnpm"
+            && command.args.first().map(String::as_str) == Some("dlx")
+        {
+            "pnpm dlx".to_string()
+        } else {
+            command.program.clone()
+        },
+        command: std::iter::once(command.program.clone())
+            .chain(command.args.iter().cloned())
+            .collect(),
+        evidence,
+    }
+}
+
+fn build_project_install_commands(
+    detection: &RepositoryDetection,
+    override_tool: Option<&str>,
+) -> Result<Vec<RunCommand>, CliError> {
+    let mut commands = Vec::new();
+    if detection.package_json {
+        let tool = override_tool
+            .or_else(|| {
+                detection
+                    .manager
+                    .as_ref()
+                    .map(|manager| manager.name.display_name())
+            })
+            .ok_or_else(|| CliError {
+                message: "could not determine the JavaScript package manager; use --tool"
+                    .to_string(),
+                exit_code: 1,
+            })?;
+        if !matches!(tool, "npm" | "pnpm" | "yarn" | "bun") {
+            return Err(CliError {
+                message: format!("unsupported JavaScript package manager: {tool}"),
+                exit_code: 2,
+            });
+        }
+        commands.push(RunCommand {
+            program: tool.to_string(),
+            args: vec!["install".to_string()],
+            working_directory: detection.root.clone(),
+        });
+    }
+    for component in &detection.components {
+        let Some(tool) = component.tool.as_deref() else {
+            continue;
+        };
+        let working_directory = detection.root.join(&component.path);
+        let command = match component.ecosystem {
+            Ecosystem::Python => match tool {
+                "uv" => ("uv", vec!["sync".to_string()]),
+                "poetry" => ("poetry", vec!["install".to_string()]),
+                "pdm" => ("pdm", vec!["install".to_string()]),
+                "pip" => {
+                    let requirements = component
+                        .manifests
+                        .iter()
+                        .find(|path| path.ends_with(".txt"))
+                        .cloned()
+                        .ok_or_else(|| CliError {
+                            message: format!(
+                                "Python component {} has no requirements file",
+                                component.path
+                            ),
+                            exit_code: 1,
+                        })?;
+                    (
+                        "pip",
+                        vec!["install".to_string(), "-r".to_string(), requirements],
+                    )
+                }
+                _ => continue,
+            },
+            Ecosystem::Rust => ("cargo", vec!["fetch".to_string()]),
+            Ecosystem::JavaScript | Ecosystem::Container => continue,
+        };
+        commands.push(RunCommand {
+            program: command.0.to_string(),
+            args: command.1,
+            working_directory,
+        });
+    }
+    if commands.is_empty() {
+        return Err(CliError {
+            message: "no declared installable project components detected".to_string(),
+            exit_code: 1,
+        });
+    }
+    Ok(commands)
+}
+
+fn dispatch_project_install(
+    commands: Vec<RunCommand>,
+    dry_run: bool,
+    json: bool,
+) -> Result<String, CliError> {
+    if dry_run {
+        let plans = commands.iter().map(execution_plan).collect::<Vec<_>>();
+        return if json {
+            serde_json::to_string_pretty(&plans).map_err(|error| CliError {
+                message: format!("failed to serialize execution plans: {error}"),
+                exit_code: 1,
+            })
+        } else {
+            Ok(plans
+                .iter()
+                .map(|plan| {
+                    format!(
+                        "{}  {}   {}",
+                        plan.ecosystem,
+                        plan.tool,
+                        plan.command.join(" ")
+                    )
+                })
+                .chain(std::iter::once(format!("{} components", plans.len())))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+    }
+    println!("PAX install: {} components", commands.len());
+    let mut first_failure = None;
+    for command in commands {
+        println!("→ {}", command.args.join(" "));
+        match Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                first_failure.get_or_insert(status.code().unwrap_or(1));
+            }
+            Err(error) => {
+                eprintln!("failed to execute {}: {error}", command.program);
+                first_failure.get_or_insert(1);
+            }
+        }
+    }
+    first_failure.map_or(Ok(String::new()), |code| {
+        Err(CliError {
+            message: String::new(),
+            exit_code: code.min(u8::MAX as i32) as u8,
+        })
+    })
+}
+
+fn build_run_command(
+    detection: &RepositoryDetection,
+    run_args: &[String],
+    override_tool: Option<&str>,
+) -> Result<RunCommand, CliError> {
+    let target = run_args.first().ok_or_else(|| CliError {
+        message: format!("pax run requires a target\n\n{}", usage()),
+        exit_code: 2,
+    })?;
+    let extra_args = &run_args[1..];
+
+    let manager = override_tool
+        .and_then(PackageManager::parse)
+        .map(|name| DetectedManager {
+            name,
+            version: None,
+            lockfile: None,
+            selected_by: "explicit --tool override".to_string(),
+        })
+        .or_else(|| detection.manager.clone());
+    if let Some(manager) = manager.as_ref() {
+        let mut args = vec!["run".to_string(), target.clone()];
+        args.extend(extra_args.iter().cloned());
+        return Ok(RunCommand {
+            program: manager.name.display_name().to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    let component = detection
+        .components
+        .iter()
+        .filter(|component| component.path == ".")
+        .find(|component| matches!(component.ecosystem, Ecosystem::Python))
+        .or_else(|| {
+            detection
+                .components
+                .iter()
+                .filter(|component| component.path == ".")
+                .find(|component| matches!(component.ecosystem, Ecosystem::Rust))
+        })
+        .or_else(|| {
+            detection
+                .components
+                .iter()
+                .filter(|component| component.path == ".")
+                .find(|component| matches!(component.ecosystem, Ecosystem::Container))
+        })
+        .ok_or_else(|| CliError {
+            message: "could not detect an authoritative execution tool".to_string(),
+            exit_code: 1,
+        })?;
+    let working_directory = if component.path == "." {
+        detection.root.clone()
+    } else {
+        detection.root.join(&component.path)
+    };
+    let mut args = Vec::new();
+    let program = match (component.ecosystem, component.tool.as_deref()) {
+        (Ecosystem::Python, Some("uv" | "poetry" | "pdm")) => {
+            args.push("run".to_string());
+            component.tool.clone().unwrap()
+        }
+        (Ecosystem::Python, Some("pip")) => "python".to_string(),
+        (Ecosystem::Rust, Some("cargo")) => {
+            args.extend(["run".to_string(), "--bin".to_string(), target.clone()]);
+            args.extend(["--".to_string()]);
+            "cargo".to_string()
+        }
+        (Ecosystem::Container, Some("docker")) => {
+            args.push("compose".to_string());
+            if matches!(target.as_str(), "up" | "down" | "logs" | "ps") {
+                args.push(target.clone());
+            } else {
+                args.extend(["run".to_string(), "--rm".to_string(), target.clone()]);
+            }
+            "docker".to_string()
+        }
+        _ => {
+            return Err(CliError {
+                message: "could not detect an authoritative execution tool".to_string(),
+                exit_code: 1,
+            });
+        }
+    };
+    if !matches!(component.ecosystem, Ecosystem::Rust | Ecosystem::Container) {
+        args.push(target.clone());
+    }
+    args.extend(extra_args.iter().cloned());
+    Ok(RunCommand {
+        program,
+        args,
+        working_directory,
+    })
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
@@ -479,6 +1382,13 @@ fn detect_components(
             }))
             .collect(),
             workspace_packages: Vec::new(),
+            dependency_sources: lockfiles
+                .iter()
+                .map(|path| DependencySource {
+                    kind: "lockfile".to_string(),
+                    path: path.clone(),
+                })
+                .collect(),
         };
         components.insert(0, component);
     }
@@ -642,10 +1552,25 @@ fn detect_python_component(
         path: relative.to_string(),
         ecosystem: Ecosystem::Python,
         tool: Some(tool.to_string()),
-        manifests: found,
-        lockfiles,
+        manifests: found.clone(),
+        lockfiles: lockfiles.clone(),
         evidence,
         workspace_packages: Vec::new(),
+        dependency_sources: found
+            .iter()
+            .map(|path| DependencySource {
+                kind: if path == "pyproject.toml" {
+                    "manifest".to_string()
+                } else {
+                    "requirements".to_string()
+                },
+                path: path.clone(),
+            })
+            .chain(lockfiles.iter().map(|path| DependencySource {
+                kind: "lockfile".to_string(),
+                path: path.clone(),
+            }))
+            .collect(),
     })
 }
 
@@ -730,9 +1655,16 @@ fn detect_rust_component(
         ecosystem: Ecosystem::Rust,
         tool: Some("cargo".to_string()),
         manifests: vec!["Cargo.toml".to_string()],
-        lockfiles,
+        lockfiles: lockfiles.clone(),
         evidence,
         workspace_packages: parse_toml_list(&contents, "[workspace]", "members"),
+        dependency_sources: lockfiles
+            .iter()
+            .map(|path| DependencySource {
+                kind: "lockfile".to_string(),
+                path: path.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -834,6 +1766,7 @@ fn detect_container_component(
         lockfiles: Vec::new(),
         evidence,
         workspace_packages: Vec::new(),
+        dependency_sources: Vec::new(),
     })
 }
 

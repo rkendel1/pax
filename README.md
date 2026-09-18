@@ -14,6 +14,14 @@ pax deps
 pax scripts
 pax workspaces
 pax lock
+pax run dev
+pax x prettier
+pax install
+pax install react
+pax add react
+pax remove react
+pax exec npx prisma generate
+pax deploy --dry-run
 pax --json info
 pax --json doctor
 ```
@@ -37,6 +45,41 @@ Python, Cargo, package managers, or the Docker daemon.
 package metadata, script definitions, workspace configuration, and lockfile
 state. All commands support `--json`; PAX only reads repository files and
 never invokes a package manager.
+
+`pax run <target> [args...]` delegates to the detected native tool without
+interpreting the target: JavaScript uses the selected package manager, Python
+uses `uv`, Poetry, PDM, or Python, Rust uses Cargo, and Compose uses Docker
+Compose. Standard input/output/error, environment, working directory, and the
+delegated process exit status are preserved.
+
+`pax x <package> [args...]` delegates package execution to the ecosystem's
+native runner, such as `npx`, `pnpm dlx`, `bunx`, `yarn dlx`, `uvx`, or `pipx`.
+`pax x install [args...]` delegates dependency installation to the detected
+native package manager, including commands such as `pip install -r
+requirements.txt`.
+
+`pax install [package...]` is the universal installation entry point. It
+delegates both project installs and package additions to the authoritative
+ecosystem tool without reimplementing package-manager behavior.
+
+The command vocabulary is intentionally narrow:
+
+- `pax run` — project task runner
+- `pax x` — ephemeral package/tool runner
+- `pax install` — dependency installation
+- `pax add` / `pax remove` — dependency mutations
+- `pax exec` — exact native command escape hatch
+
+PAX resolves the ecosystem tool and delegates to it; it does not replace npm,
+pnpm, Yarn, Bun, uv, pip, Poetry, PDM, Cargo, or Docker. Use `--tool` for an
+explicit override and `--dry-run` (optionally with `--json`) to inspect the
+execution plan without running it.
+
+`pax deploy` detects Fly.io (`fly.toml`), Vercel (`vercel.json` or
+`.vercel/project.json`), or Netlify (`netlify.toml`) evidence and delegates to
+the provider CLI. Use `--tool fly`, `--tool vercel`, or `--tool netlify` to
+disambiguate or explicitly select a provider. `--dry-run` reports the selected
+provider, evidence, and canonical command without executing it.
 
 ## Detection model
 
