@@ -433,6 +433,9 @@ fn build_x_command(
         exit_code: 2,
     })?;
     let mut args = run_args.to_vec();
+    if package == "install" {
+        return build_install_command(detection, &args[1..]);
+    }
     let program = if let Some(manager) = detection.manager.as_ref() {
         match manager.name {
             PackageManager::Npm => "npx",
@@ -440,6 +443,7 @@ fn build_x_command(
                 args.insert(0, "dlx".to_string());
                 "pnpm"
             }
+
             PackageManager::Bun => "bunx",
             PackageManager::Yarn => {
                 args.insert(0, "dlx".to_string());
@@ -468,6 +472,53 @@ fn build_x_command(
         });
     };
     let _ = package;
+    Ok(RunCommand {
+        program: program.to_string(),
+        args,
+        working_directory: detection.root.clone(),
+    })
+}
+
+fn build_install_command(
+    detection: &RepositoryDetection,
+    install_args: &[String],
+) -> Result<RunCommand, CliError> {
+    if let Some(manager) = detection.manager.as_ref() {
+        let mut args = vec!["install".to_string()];
+        args.extend(install_args.iter().cloned());
+        return Ok(RunCommand {
+            program: manager.name.display_name().to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    let component = detection
+        .components
+        .iter()
+        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
+        .ok_or_else(|| CliError {
+            message: "could not detect an authoritative package manager".to_string(),
+            exit_code: 1,
+        })?;
+    let mut args = Vec::new();
+    let program = match component.tool.as_deref() {
+        Some("uv") => {
+            args.push("pip".to_string());
+            "uv"
+        }
+        Some("poetry") => "poetry",
+        Some("pdm") => "pdm",
+        Some("pip") => "pip",
+        _ => {
+            return Err(CliError {
+                message: "could not detect an authoritative package manager".to_string(),
+                exit_code: 1,
+            });
+        }
+    };
+    args.push("install".to_string());
+    args.extend(install_args.iter().cloned());
     Ok(RunCommand {
         program: program.to_string(),
         args,

@@ -48,6 +48,9 @@ delegated process exit status are preserved.
 
 `pax x <package> [args...]` delegates package execution to the ecosystem's
 native runner, such as `npx`, `pnpm dlx`, `bunx`, `yarn dlx`, `uvx`, or `pipx`.
+`pax x install [args...]` delegates dependency installation to the detected
+native package manager, including commands such as `pip install -r
+requirements.txt`.
 
 ## Detection model
 

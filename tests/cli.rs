@@ -237,3 +237,32 @@ fn x_delegates_to_native_package_runner() {
         format!("{}|dlx|prettier", root.display())
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn x_install_delegates_python_requirements_to_pip() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(&root.join("requirements.txt"), "requests==2.32.0\n");
+    let pip = bin.join("pip");
+    write(
+        &pip,
+        "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$PWD\" \"$1\" \"$2\" \"$3\"\nexit 0\n",
+    );
+    fs::set_permissions(&pip, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["x", "install", "-r", "requirements.txt"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}|install|-r|requirements.txt", root.display())
+    );
+}
