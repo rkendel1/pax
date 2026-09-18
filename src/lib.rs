@@ -497,21 +497,14 @@ where
                     | CommandName::Add
                     | CommandName::Remove
             )
-            && detection
-                .components
-                .iter()
-                .any(|component| {
-                    component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
-                })
+            && detection.components.iter().any(|component| {
+                component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
+            })
     {
         return Err(CliError {
-            message: if detection
-                .components
-                .iter()
-                .any(|component| {
-                    component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
-                })
-            {
+            message: if detection.components.iter().any(|component| {
+                component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
+            }) {
                 "ambiguous Python toolchain: multiple lockfiles detected; use --tool uv, --tool poetry, --tool pdm, or --tool pip".to_string()
             } else {
                 format!(
@@ -1090,6 +1083,18 @@ where
     if !args.is_empty() {
         args.remove(0);
     }
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        return Err(CliError {
+            message: usage(),
+            exit_code: 0,
+        });
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        return Err(CliError {
+            message: format!("pax {}", env!("CARGO_PKG_VERSION")),
+            exit_code: 0,
+        });
+    }
 
     let mut json = false;
     let mut dry_run = false;
@@ -1114,10 +1119,14 @@ where
             live = true;
         } else if options && arg == "--tool" {
             index += 1;
-            tool = Some(args.get(index).ok_or_else(|| CliError {
-                message: "pax --tool requires a tool".to_string(),
-                exit_code: 2,
-            })?.clone());
+            tool = Some(
+                args.get(index)
+                    .ok_or_else(|| CliError {
+                        message: "pax --tool requires a tool".to_string(),
+                        exit_code: 2,
+                    })?
+                    .clone(),
+            );
         } else if options && arg == "--dir" {
             index += 1;
             dir = Some(PathBuf::from(args.get(index).ok_or_else(|| CliError {
@@ -1208,7 +1217,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: pax [--json] [--live] [--dry-run] [--tool <tool>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock|graph|reality|drift>"
+    "usage: pax [--json] [--live] [--dry-run] [--tool <tool>] [--dir <path>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock|graph|reality|drift>"
         .to_string()
 }
 
@@ -1667,7 +1676,11 @@ fn build_project_install_commands(
                     {
                         (
                             "pip",
-                            vec!["install".to_string(), "-r".to_string(), requirements.clone()],
+                            vec![
+                                "install".to_string(),
+                                "-r".to_string(),
+                                requirements.clone(),
+                            ],
                         )
                     } else {
                         ("pip", vec!["install".to_string(), ".".to_string()])
@@ -1776,11 +1789,21 @@ fn build_run_command(
                 tool
             }
             "cargo" => {
-                args.extend(["run".to_string(), "--bin".to_string(), target.clone(), "--".to_string()]);
+                args.extend([
+                    "run".to_string(),
+                    "--bin".to_string(),
+                    target.clone(),
+                    "--".to_string(),
+                ]);
                 "cargo"
             }
             "docker" => {
-                args.extend(["compose".to_string(), "run".to_string(), "--rm".to_string(), target.clone()]);
+                args.extend([
+                    "compose".to_string(),
+                    "run".to_string(),
+                    "--rm".to_string(),
+                    target.clone(),
+                ]);
                 "docker"
             }
             _ => {

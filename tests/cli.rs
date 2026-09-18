@@ -596,3 +596,84 @@ fn deploy_delegates_with_explicit_tool_and_preserves_exit_code() {
         format!("{}|deploy|--remote-only", root.display())
     );
 }
+
+#[test]
+fn dir_selects_project_root_for_inspection() {
+    let root = temp_dir();
+    write(
+        &root.join("nested/package.json"),
+        r#"{"name":"nested-project","packageManager":"npm@10"}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dir", "nested", "info"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["project"]["name"], "nested-project");
+    assert_eq!(
+        value["project"]["root"],
+        root.join("nested").to_str().unwrap()
+    );
+}
+
+#[test]
+fn help_and_version_are_successful_cli_queries() {
+    for args in [["--help"], ["--version"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn ambiguous_python_lockfiles_fail_closed_without_override() {
+    let root = temp_dir();
+    write(
+        &root.join("pyproject.toml"),
+        "[project]\nname = \"sample\"\n",
+    );
+    write(&root.join("uv.lock"), "version = 1\n");
+    write(&root.join("poetry.lock"), "[[package]]\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("install")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("ambiguous Python toolchain")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn delegated_arguments_after_separator_are_not_consumed_by_pax() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"npm@10"}"#,
+    );
+    let npm = bin.join("npm");
+    write(&npm, "#!/bin/sh\nprintf '%s' \"$3\"\n");
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["run", "print", "--", "--json"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "--json");
+}

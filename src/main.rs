@@ -30,7 +30,11 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             if !error.message.is_empty() {
-                eprintln!("{}", error.message);
+                if error.exit_code == 0 {
+                    println!("{}", error.message);
+                } else {
+                    eprintln!("{}", error.message);
+                }
             }
             ExitCode::from(error.exit_code)
         }

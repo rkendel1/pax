@@ -32,6 +32,9 @@ pax --json doctor
 pax --json graph
 pax --json reality
 pax --json drift
+pax --dir path/to/project info
+pax --help
+pax --version
 ```
 
 `pax info` reports detected package-manager reality for the current repository, including lockfile, workspace, and manager-selection evidence.
