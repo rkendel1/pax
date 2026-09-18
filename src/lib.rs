@@ -2162,7 +2162,7 @@ fn detect_rust_component(
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
     let contents = fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
-    let mut section = "dependency";
+    let mut section = "other";
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
@@ -2170,10 +2170,14 @@ fn detect_rust_component(
                 "development"
             } else if trimmed.contains("build-dependencies") {
                 "build"
-            } else {
+            } else if trimmed == "[dependencies]" {
                 "dependency"
+            } else {
+                "other"
             };
-        } else if let Some((name, specifier)) = trimmed.split_once('=') {
+        } else if section != "other"
+            && let Some((name, specifier)) = trimmed.split_once('=')
+        {
             let name = name.trim();
             if !name.is_empty()
                 && name
