@@ -32,6 +32,9 @@ pax --json doctor
 pax --json graph
 pax --json reality
 pax --json drift
+pax --dir path/to/project info
+pax --help
+pax --version
 ```
 
 `pax info` reports detected package-manager reality for the current repository, including lockfile, workspace, and manager-selection evidence.
@@ -98,6 +101,32 @@ execution plan without running it.
 the provider CLI. Use `--tool fly`, `--tool vercel`, or `--tool netlify` to
 disambiguate or explicitly select a provider. `--dry-run` reports the selected
 provider, evidence, and canonical command without executing it.
+
+## Architecture audit contract
+
+PAX owns detection, planning, observation, and evidence. Native tools remain
+authoritative for execution and ecosystem semantics; PAX does not resolve
+dependencies, implement a registry, or replace a package manager, build system,
+shell, container runtime, or deployment provider.
+
+| Command | Boundary | Mutates | External process | Evidence |
+| --- | --- | --- | --- | --- |
+| `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | no | project files |
+| `graph`, `reality`, `drift` | native observation | no | only `--live` | manifests, locks, installed/runtime observations |
+| `run`, `x`, `install`, `add`, `remove` | delegated/composite | install or mutation commands may | yes | detected or overridden tool |
+| `exec` | exact delegation | depends on supplied command | yes | user-supplied command |
+
+Tool selection is deterministic and fail-closed: an explicit `--tool` override
+is selected first, then a recognized `packageManager` field, then lockfile
+evidence. Contradictory lockfiles without an override are reported as
+`ambiguous`; PAX never silently resolves the conflict. Use `--dir` to select a
+specific project root. Use `--` when arguments to a delegated command must not
+be interpreted as PAX flags.
+
+JSON output is a versioned machine-readable contract. Observation statuses are
+`match`, `drift`, `ambiguous`, or `unknown`; unknown evidence is never promoted
+to drift. Exit code `0` means success/match, `1` means delegated failure or
+drift, and `2` means invalid input or ambiguity.
 
 ## Detection model
 
