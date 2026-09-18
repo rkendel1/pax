@@ -18,6 +18,9 @@ pax run dev
 pax x prettier
 pax install
 pax install react
+pax add react
+pax remove react
+pax exec npx prisma generate
 pax deploy --dry-run
 pax --json info
 pax --json doctor
@@ -58,6 +61,19 @@ requirements.txt`.
 `pax install [package...]` is the universal installation entry point. It
 delegates both project installs and package additions to the authoritative
 ecosystem tool without reimplementing package-manager behavior.
+
+The command vocabulary is intentionally narrow:
+
+- `pax run` — project task runner
+- `pax x` — ephemeral package/tool runner
+- `pax install` — dependency installation
+- `pax add` / `pax remove` — dependency mutations
+- `pax exec` — exact native command escape hatch
+
+PAX resolves the ecosystem tool and delegates to it; it does not replace npm,
+pnpm, Yarn, Bun, uv, pip, Poetry, PDM, Cargo, or Docker. Use `--tool` for an
+explicit override and `--dry-run` (optionally with `--json`) to inspect the
+execution plan without running it.
 
 `pax deploy` detects Fly.io (`fly.toml`), Vercel (`vercel.json` or
 `.vercel/project.json`), or Netlify (`netlify.toml`) evidence and delegates to

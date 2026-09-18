@@ -302,6 +302,91 @@ fn install_delegates_project_and_package_installation_to_npm() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn add_and_remove_delegate_to_native_package_manager() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"pnpm@10.0.0"}"#,
+    );
+    let pnpm = bin.join("pnpm");
+    write(
+        &pnpm,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\nexit 0\n",
+    );
+    fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for args in [["add", "react"], ["remove", "react"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(args)
+            .current_dir(&root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), path.to_string_lossy()),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}|{}|react", root.display(), args[0])
+        );
+    }
+}
+
+#[test]
+fn dry_run_produces_machine_readable_execution_plan() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"pnpm@10.0.0"}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dry-run", "x", "vite"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["operation"], "package-run");
+    assert_eq!(value["tool"], "pnpm");
+    assert_eq!(value["command"][0], "pnpm");
+    assert_eq!(value["command"][1], "dlx");
+}
+
+#[test]
+fn ambiguous_javascript_tools_fail_closed_without_override() {
+    let root = temp_dir();
+    write(&root.join("package.json"), r#"{"name":"sample"}"#);
+    write(&root.join("package-lock.json"), "{}");
+    write(&root.join("pnpm-lock.yaml"), "lockfileVersion: '9'\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["install"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("multiple JavaScript package managers")
+    );
+}
+
+#[test]
+fn exec_forwards_exact_command_without_detection() {
+    let root = temp_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["exec", "printf", "ok"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "ok");
+}
+
 #[test]
 fn deploy_dry_run_reports_provider_evidence_and_command() {
     let root = temp_dir();
