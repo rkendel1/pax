@@ -14,6 +14,11 @@ pax deps
 pax scripts
 pax workspaces
 pax lock
+pax graph
+pax reality
+pax drift
+pax reality --live
+pax drift --live
 pax run dev
 pax x prettier
 pax install
@@ -24,6 +29,9 @@ pax exec npx prisma generate
 pax deploy --dry-run
 pax --json info
 pax --json doctor
+pax --json graph
+pax --json reality
+pax --json drift
 ```
 
 `pax info` reports detected package-manager reality for the current repository, including lockfile, workspace, and manager-selection evidence.
@@ -45,6 +53,16 @@ Python, Cargo, package managers, or the Docker daemon.
 package metadata, script definitions, workspace configuration, and lockfile
 state. All commands support `--json`; PAX only reads repository files and
 never invokes a package manager.
+
+`pax graph` reports project components and native dependency relationships with
+ecosystem-specific types and evidence. `pax reality` separates declared,
+resolved, installed, and runtime observations; runtime inspection is opt-in
+with `--live`. `pax drift` reports contradictions between those layers and
+never repairs them. Static observation does not require package managers,
+network access, or a Docker daemon.
+
+`pax drift` uses exit code 0 for no drift, 1 for detected drift, and 2 for
+ambiguous observations. Invalid input uses exit code 2.
 
 `pax run <target> [args...]` delegates to the detected native tool without
 interpreting the target: JavaScript uses the selected package manager, Python
