@@ -69,3 +69,90 @@ fn doctor_text_reports_expected_checks() {
     assert!(stdout.contains("✓ package.json"));
     assert!(stdout.contains("✓ package/lock consistency"));
 }
+
+#[test]
+fn inspection_commands_report_package_json_data_as_json() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{
+          "name": "sample",
+          "dependencies": {"react": "^19.0.0"},
+          "devDependencies": {"typescript": "^5.0.0"},
+          "scripts": {"build": "tsc"},
+          "workspaces": ["packages/*"]
+        }"#,
+    );
+    write(&root.join("package-lock.json"), "{}");
+
+    for command in ["deps", "scripts", "workspaces", "lock"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(["--json", command])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{command} failed");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["command"], command);
+        assert_eq!(value["project"]["name"], "sample");
+
+        match command {
+            "deps" => assert_eq!(value["dependencies"]["dependencies"]["react"], "^19.0.0"),
+            "scripts" => assert_eq!(value["scripts"]["build"], "tsc"),
+            "workspaces" => assert_eq!(value["workspaces"]["packages"][0], "packages/*"),
+            "lock" => assert_eq!(value["lock"]["selected"], "package-lock.json"),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn info_json_detects_python_rust_and_docker_components() {
+    let root = temp_dir();
+    write(
+        &root.join("services/api/pyproject.toml"),
+        "[project]\nname = \"api\"\ndependencies = [\"pytest\"]\n",
+    );
+    write(&root.join("services/api/uv.lock"), "version = 1\n");
+    write(
+        &root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\n[dependencies]\nserde = \"1\"\n[dev-dependencies]\ncriterion = \"1\"\n",
+    );
+    write(&root.join("crates/core/Cargo.lock"), "");
+    write(
+        &root.join("Dockerfile"),
+        "FROM rust:latest\nWORKDIR /app\nEXPOSE 8080\n",
+    );
+    write(
+        &root.join("compose.yaml"),
+        "services:\n  api:\n    image: postgres:16\n  redis:\n    image: redis:7\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "info"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let components = value["components"].as_array().unwrap();
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "python" && item["tool"] == "uv")
+    );
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "rust" && item["tool"] == "cargo")
+    );
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "container" && item["tool"] == "docker")
+    );
+    assert_eq!(value["container"]["services"][0], "api");
+    assert_eq!(value["container"]["images"][1], "redis:7");
+    assert_eq!(value["container"]["directives"]["WORKDIR"][0], "/app");
+}
