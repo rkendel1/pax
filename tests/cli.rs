@@ -205,3 +205,35 @@ fn run_delegates_to_detected_manager_and_preserves_exit_code() {
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
 }
+
+#[cfg(unix)]
+#[test]
+fn x_delegates_to_native_package_runner() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"pnpm@10.0.0"}"#,
+    );
+    let pnpm = bin.join("pnpm");
+    write(
+        &pnpm,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\nexit 0\n",
+    );
+    fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["x", "prettier", "--check"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}|dlx|prettier", root.display())
+    );
+}

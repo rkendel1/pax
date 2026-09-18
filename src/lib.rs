@@ -63,6 +63,7 @@ pub struct CliError {
 #[derive(Clone, Copy, Debug)]
 enum CommandName {
     Run,
+    X,
     Info,
     Doctor,
     Deps,
@@ -297,9 +298,32 @@ where
             }),
         };
     }
+    if let CommandName::X = cli.command {
+        let command = build_x_command(&detection, &cli.run_args)?;
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+            .map_err(|error| CliError {
+                message: format!("failed to execute {}: {error}", command.program),
+                exit_code: 1,
+            })?;
+        return match status.code() {
+            Some(0) => Ok(String::new()),
+            Some(code) => Err(CliError {
+                message: String::new(),
+                exit_code: code.min(u8::MAX as i32) as u8,
+            }),
+            None => Err(CliError {
+                message: String::new(),
+                exit_code: 1,
+            }),
+        };
+    }
 
     let output = match cli.command {
         CommandName::Run => unreachable!(),
+        CommandName::X => unreachable!(),
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
         CommandName::Deps => build_output("deps", detection, false),
@@ -338,15 +362,19 @@ where
     args.retain(|arg| arg != "--json");
 
     let (command, run_args) = match args.as_slice() {
-        [command, target, rest @ ..] if command == "run" => {
+        [command, target, rest @ ..] if command == "run" || command == "x" => {
             if target.is_empty() {
                 return Err(CliError {
-                    message: format!("pax run requires a target\n\n{}", usage()),
+                    message: format!("pax {command} requires a target\n\n{}", usage()),
                     exit_code: 2,
                 });
             }
             (
-                CommandName::Run,
+                if command == "run" {
+                    CommandName::Run
+                } else {
+                    CommandName::X
+                },
                 std::iter::once(target.clone())
                     .chain(rest.iter().cloned())
                     .collect(),
@@ -361,6 +389,12 @@ where
         [command] if command == "run" => {
             return Err(CliError {
                 message: format!("pax run requires a target\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
+        [command] if command == "x" => {
+            return Err(CliError {
+                message: format!("pax x requires a package\n\n{}", usage()),
                 exit_code: 2,
             });
         }
@@ -386,8 +420,59 @@ where
 }
 
 fn usage() -> String {
-    "usage: pax [--json] <run <target> [args...]|info|doctor|deps|scripts|workspaces|lock>"
+    "usage: pax [--json] <run <target> [args...]|x <package> [args...]|info|doctor|deps|scripts|workspaces|lock>"
         .to_string()
+}
+
+fn build_x_command(
+    detection: &RepositoryDetection,
+    run_args: &[String],
+) -> Result<RunCommand, CliError> {
+    let package = run_args.first().ok_or_else(|| CliError {
+        message: format!("pax x requires a package\n\n{}", usage()),
+        exit_code: 2,
+    })?;
+    let mut args = run_args.to_vec();
+    let program = if let Some(manager) = detection.manager.as_ref() {
+        match manager.name {
+            PackageManager::Npm => "npx",
+            PackageManager::Pnpm => {
+                args.insert(0, "dlx".to_string());
+                "pnpm"
+            }
+            PackageManager::Bun => "bunx",
+            PackageManager::Yarn => {
+                args.insert(0, "dlx".to_string());
+                "yarn"
+            }
+        }
+    } else if let Some(component) = detection
+        .components
+        .iter()
+        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
+    {
+        match component.tool.as_deref() {
+            Some("uv") => "uvx",
+            Some("poetry" | "pdm" | "pip") => "pipx",
+            _ => {
+                return Err(CliError {
+                    message: "could not detect an authoritative package runner".to_string(),
+                    exit_code: 1,
+                });
+            }
+        }
+    } else {
+        return Err(CliError {
+            message: "could not detect an authoritative package runner".to_string(),
+            exit_code: 1,
+        });
+    };
+    let _ = package;
+    Ok(RunCommand {
+        program: program.to_string(),
+        args,
+        working_directory: detection.root.clone(),
+    })
 }
 
 fn build_run_command(

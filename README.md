@@ -15,6 +15,7 @@ pax scripts
 pax workspaces
 pax lock
 pax run dev
+pax x prettier
 pax --json info
 pax --json doctor
 ```
@@ -44,6 +45,9 @@ interpreting the target: JavaScript uses the selected package manager, Python
 uses `uv`, Poetry, PDM, or Python, Rust uses Cargo, and Compose uses Docker
 Compose. Standard input/output/error, environment, working directory, and the
 delegated process exit status are preserved.
+
+`pax x <package> [args...]` delegates package execution to the ecosystem's
+native runner, such as `npx`, `pnpm dlx`, `bunx`, `yarn dlx`, `uvx`, or `pipx`.
 
 ## Detection model
 
