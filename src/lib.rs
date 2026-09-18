@@ -4,6 +4,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +62,7 @@ pub struct CliError {
 
 #[derive(Clone, Copy, Debug)]
 enum CommandName {
+    Run,
     Info,
     Doctor,
     Deps,
@@ -254,6 +256,13 @@ struct DetectedManager {
     selected_by: String,
 }
 
+#[derive(Clone, Debug)]
+struct RunCommand {
+    program: String,
+    args: Vec<String>,
+    working_directory: PathBuf,
+}
+
 pub fn run<I, S>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -266,7 +275,31 @@ where
     })?;
 
     let detection = detect_repository(&cwd)?;
+    if let CommandName::Run = cli.command {
+        let command = build_run_command(&detection, &cli.run_args)?;
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+            .map_err(|error| CliError {
+                message: format!("failed to execute {}: {error}", command.program),
+                exit_code: 1,
+            })?;
+        return match status.code() {
+            Some(0) => Ok(String::new()),
+            Some(code) => Err(CliError {
+                message: String::new(),
+                exit_code: code.min(u8::MAX as i32) as u8,
+            }),
+            None => Err(CliError {
+                message: String::new(),
+                exit_code: 1,
+            }),
+        };
+    }
+
     let output = match cli.command {
+        CommandName::Run => unreachable!(),
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
         CommandName::Deps => build_output("deps", detection, false),
@@ -288,6 +321,7 @@ where
 struct ParsedCli {
     command: CommandName,
     json: bool,
+    run_args: Vec<String>,
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli, CliError>
@@ -303,13 +337,33 @@ where
     let json = args.iter().any(|arg| arg == "--json");
     args.retain(|arg| arg != "--json");
 
-    let command = match args.as_slice() {
-        [command] if command == "info" => CommandName::Info,
-        [command] if command == "doctor" => CommandName::Doctor,
-        [command] if command == "deps" => CommandName::Deps,
-        [command] if command == "scripts" => CommandName::Scripts,
-        [command] if command == "workspaces" => CommandName::Workspaces,
-        [command] if command == "lock" => CommandName::Lock,
+    let (command, run_args) = match args.as_slice() {
+        [command, target, rest @ ..] if command == "run" => {
+            if target.is_empty() {
+                return Err(CliError {
+                    message: format!("pax run requires a target\n\n{}", usage()),
+                    exit_code: 2,
+                });
+            }
+            (
+                CommandName::Run,
+                std::iter::once(target.clone())
+                    .chain(rest.iter().cloned())
+                    .collect(),
+            )
+        }
+        [command] if command == "info" => (CommandName::Info, Vec::new()),
+        [command] if command == "doctor" => (CommandName::Doctor, Vec::new()),
+        [command] if command == "deps" => (CommandName::Deps, Vec::new()),
+        [command] if command == "scripts" => (CommandName::Scripts, Vec::new()),
+        [command] if command == "workspaces" => (CommandName::Workspaces, Vec::new()),
+        [command] if command == "lock" => (CommandName::Lock, Vec::new()),
+        [command] if command == "run" => {
+            return Err(CliError {
+                message: format!("pax run requires a target\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
         [] => {
             return Err(CliError {
                 message: usage(),
@@ -324,11 +378,103 @@ where
         }
     };
 
-    Ok(ParsedCli { command, json })
+    Ok(ParsedCli {
+        command,
+        json,
+        run_args,
+    })
 }
 
 fn usage() -> String {
-    "usage: pax [--json] <info|doctor|deps|scripts|workspaces|lock>".to_string()
+    "usage: pax [--json] <run <target> [args...]|info|doctor|deps|scripts|workspaces|lock>"
+        .to_string()
+}
+
+fn build_run_command(
+    detection: &RepositoryDetection,
+    run_args: &[String],
+) -> Result<RunCommand, CliError> {
+    let target = run_args.first().ok_or_else(|| CliError {
+        message: format!("pax run requires a target\n\n{}", usage()),
+        exit_code: 2,
+    })?;
+    let extra_args = &run_args[1..];
+
+    if let Some(manager) = detection.manager.as_ref() {
+        let mut args = vec!["run".to_string(), target.clone()];
+        args.extend(extra_args.iter().cloned());
+        return Ok(RunCommand {
+            program: manager.name.display_name().to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    let component = detection
+        .components
+        .iter()
+        .filter(|component| component.path == ".")
+        .find(|component| matches!(component.ecosystem, Ecosystem::Python))
+        .or_else(|| {
+            detection
+                .components
+                .iter()
+                .filter(|component| component.path == ".")
+                .find(|component| matches!(component.ecosystem, Ecosystem::Rust))
+        })
+        .or_else(|| {
+            detection
+                .components
+                .iter()
+                .filter(|component| component.path == ".")
+                .find(|component| matches!(component.ecosystem, Ecosystem::Container))
+        })
+        .ok_or_else(|| CliError {
+            message: "could not detect an authoritative execution tool".to_string(),
+            exit_code: 1,
+        })?;
+    let working_directory = if component.path == "." {
+        detection.root.clone()
+    } else {
+        detection.root.join(&component.path)
+    };
+    let mut args = Vec::new();
+    let program = match (component.ecosystem, component.tool.as_deref()) {
+        (Ecosystem::Python, Some("uv" | "poetry" | "pdm")) => {
+            args.push("run".to_string());
+            component.tool.clone().unwrap()
+        }
+        (Ecosystem::Python, Some("pip")) => "python".to_string(),
+        (Ecosystem::Rust, Some("cargo")) => {
+            args.extend(["run".to_string(), "--bin".to_string(), target.clone()]);
+            args.extend(["--".to_string()]);
+            "cargo".to_string()
+        }
+        (Ecosystem::Container, Some("docker")) => {
+            args.extend([
+                "compose".to_string(),
+                "run".to_string(),
+                "--rm".to_string(),
+                target.clone(),
+            ]);
+            "docker".to_string()
+        }
+        _ => {
+            return Err(CliError {
+                message: "could not detect an authoritative execution tool".to_string(),
+                exit_code: 1,
+            });
+        }
+    };
+    if !matches!(component.ecosystem, Ecosystem::Rust | Ecosystem::Container) {
+        args.push(target.clone());
+    }
+    args.extend(extra_args.iter().cloned());
+    Ok(RunCommand {
+        program,
+        args,
+        working_directory,
+    })
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {

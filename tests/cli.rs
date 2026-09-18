@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,7 +64,11 @@ fn doctor_text_reports_expected_checks() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("PAX Doctor"));
@@ -155,4 +161,47 @@ fn info_json_detects_python_rust_and_docker_components() {
     assert_eq!(value["container"]["services"][0], "api");
     assert_eq!(value["container"]["images"][1], "redis:7");
     assert_eq!(value["container"]["directives"]["WORKDIR"][0], "/app");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_delegates_to_detected_manager_and_preserves_exit_code() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"npm@10.9.0"}"#,
+    );
+    let npm = bin.join("npm");
+    write(
+        &npm,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\n[ \"$2\" = fail ] && exit 7\nexit 0\n",
+    );
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), path.to_string_lossy());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["run", "dev", "--watch"])
+        .current_dir(&root)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}|run|dev", root.display())
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["run", "fail"])
+        .current_dir(&root)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
 }

@@ -14,6 +14,7 @@ pax deps
 pax scripts
 pax workspaces
 pax lock
+pax run dev
 pax --json info
 pax --json doctor
 ```
@@ -37,6 +38,12 @@ Python, Cargo, package managers, or the Docker daemon.
 package metadata, script definitions, workspace configuration, and lockfile
 state. All commands support `--json`; PAX only reads repository files and
 never invokes a package manager.
+
+`pax run <target> [args...]` delegates to the detected native tool without
+interpreting the target: JavaScript uses the selected package manager, Python
+uses `uv`, Poetry, PDM, or Python, Rust uses Cargo, and Compose uses Docker
+Compose. Standard input/output/error, environment, working directory, and the
+delegated process exit status are preserved.
 
 ## Detection model
 
