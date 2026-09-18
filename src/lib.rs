@@ -4,7 +4,54 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Ecosystem {
+    JavaScript,
+    Python,
+    Rust,
+    Container,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Component {
+    path: String,
+    ecosystem: Ecosystem,
+    tool: Option<String>,
+    manifests: Vec<String>,
+    lockfiles: Vec<String>,
+    evidence: Vec<EvidenceItem>,
+    workspace_packages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceItem {
+    kind: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDependency {
+    name: String,
+    specifier: String,
+    kind: String,
+    ecosystem: Ecosystem,
+    native_kind: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ContainerInfo {
+    dockerfiles: Vec<String>,
+    compose_files: Vec<String>,
+    services: Vec<String>,
+    images: Vec<String>,
+    directives: BTreeMap<String, Vec<String>>,
+}
 
 #[derive(Debug)]
 pub struct CliError {
@@ -88,6 +135,10 @@ struct CommandOutput {
     workspaces: Option<WorkspaceOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lock: Option<LockOutput>,
+    ecosystem: Option<Ecosystem>,
+    components: Vec<Component>,
+    native_dependencies: Vec<NativeDependency>,
+    container: Option<ContainerInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -190,6 +241,9 @@ struct RepositoryDetection {
     workspace_files: Vec<String>,
     workspace_packages: Vec<String>,
     selection_notes: Vec<String>,
+    components: Vec<Component>,
+    native_dependencies: Vec<NativeDependency>,
+    container: Option<ContainerInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +402,7 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
         .as_ref()
         .and_then(|data| data.name.clone())
         .unwrap_or(fallback_name);
+    let (components, native_dependencies, container) = detect_components(root);
 
     Ok(RepositoryDetection {
         root: root.to_path_buf(),
@@ -361,6 +416,424 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
         workspace_files,
         workspace_packages,
         selection_notes,
+        components,
+        native_dependencies,
+        container,
+    })
+}
+
+fn detect_components(
+    root: &Path,
+) -> (Vec<Component>, Vec<NativeDependency>, Option<ContainerInfo>) {
+    let mut roots = Vec::new();
+    collect_project_dirs(root, &mut roots);
+    let mut components = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut container = None;
+    for path in roots {
+        let relative = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|path| path.to_str())
+            .filter(|path| !path.is_empty())
+            .unwrap_or(".")
+            .to_string();
+        if let Some(component) = detect_python_component(root, &path, &relative, &mut dependencies)
+        {
+            components.push(component);
+        }
+        if let Some(component) = detect_rust_component(root, &path, &relative, &mut dependencies) {
+            components.push(component);
+        }
+        if let Some(component) = detect_container_component(root, &path, &relative, &mut container)
+        {
+            components.push(component);
+        }
+    }
+    if root.join("package.json").is_file() {
+        let manager = detect_repository_manager_name(root);
+        let lockfiles = [
+            "bun.lock",
+            "bun.lockb",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "package-lock.json",
+        ]
+        .iter()
+        .filter(|name| root.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+        let component = Component {
+            path: ".".to_string(),
+            ecosystem: Ecosystem::JavaScript,
+            tool: manager,
+            manifests: vec!["package.json".to_string()],
+            lockfiles: lockfiles.clone(),
+            evidence: std::iter::once(EvidenceItem {
+                kind: "manifest".to_string(),
+                path: "package.json".to_string(),
+            })
+            .chain(lockfiles.iter().map(|path| EvidenceItem {
+                kind: "lockfile".to_string(),
+                path: path.clone(),
+            }))
+            .collect(),
+            workspace_packages: Vec::new(),
+        };
+        components.insert(0, component);
+    }
+
+    fn detect_repository_manager_name(root: &Path) -> Option<String> {
+        let package = fs::read_to_string(root.join("package.json")).ok()?;
+        let value = serde_json::from_str::<serde_json::Value>(&package).ok()?;
+        value
+            .get("packageManager")
+            .and_then(|value| value.as_str())
+            .and_then(|value| {
+                value
+                    .split('@')
+                    .next()
+                    .filter(|name| ["npm", "pnpm", "bun", "yarn"].contains(name))
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                [
+                    ("bun.lock", "bun"),
+                    ("bun.lockb", "bun"),
+                    ("pnpm-lock.yaml", "pnpm"),
+                    ("yarn.lock", "yarn"),
+                    ("package-lock.json", "npm"),
+                ]
+                .iter()
+                .find(|(file, _)| root.join(file).is_file())
+                .map(|(_, name)| (*name).to_string())
+            })
+    }
+    components.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| format!("{:?}", a.ecosystem).cmp(&format!("{:?}", b.ecosystem)))
+    });
+    (components, dependencies, container)
+}
+
+fn collect_project_dirs(path: &Path, roots: &mut Vec<PathBuf>) {
+    roots.push(path.to_path_buf());
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+                && entry.file_name() != "target"
+                && entry.file_name() != "node_modules"
+            {
+                collect_project_dirs(&entry.path(), roots);
+            }
+        }
+    }
+}
+
+fn detect_python_component(
+    root: &Path,
+    path: &Path,
+    relative: &str,
+    dependencies: &mut Vec<NativeDependency>,
+) -> Option<Component> {
+    let manifests = ["pyproject.toml", "requirements.txt", "Pipfile"];
+    let mut found = manifests
+        .iter()
+        .filter(|name| path.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    if let Ok(entries) = fs::read_dir(path.join("requirements")) {
+        found.extend(entries.flatten().filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name.ends_with(".txt")).then_some(format!("requirements/{name}"))
+        }));
+    }
+    let lockfiles = ["uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock"]
+        .iter()
+        .filter(|name| path.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    if found.is_empty() && lockfiles.is_empty() && !path.join("requirements").is_dir() {
+        return None;
+    }
+    let tool = if path.join("uv.lock").is_file() {
+        "uv"
+    } else if path.join("poetry.lock").is_file() {
+        "poetry"
+    } else if path.join("pdm.lock").is_file() {
+        "pdm"
+    } else {
+        "pip"
+    };
+    if let Ok(contents) = fs::read_to_string(path.join("pyproject.toml")) {
+        let mut kind = "dependency";
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some((name, specifier)) = trimmed.split_once('=') {
+                let name = name.trim().trim_matches('"').trim_matches('\'');
+                if name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && !name.is_empty()
+                    && (specifier.contains('"') || specifier.contains('\''))
+                {
+                    dependencies.push(NativeDependency {
+                        name: name.to_string(),
+                        specifier: specifier
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                        kind: kind.to_string(),
+                        ecosystem: Ecosystem::Python,
+                        native_kind: if trimmed.contains("optional") {
+                            "optional-dependency".to_string()
+                        } else {
+                            "dependency-group".to_string()
+                        },
+                    });
+                }
+            }
+            for manifest in &found {
+                if manifest.ends_with(".txt") {
+                    let contents = fs::read_to_string(path.join(manifest)).unwrap_or_default();
+                    for line in contents
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    {
+                        let name = line
+                            .split(['=', '<', '>', '!', ';'])
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !name.is_empty() {
+                            dependencies.push(NativeDependency {
+                                name: name.to_string(),
+                                specifier: line[name.len()..].trim().to_string(),
+                                kind: "dependency".to_string(),
+                                ecosystem: Ecosystem::Python,
+                                native_kind: "requirements".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            if trimmed.starts_with('[') && trimmed.contains("dev") {
+                kind = "development";
+            }
+        }
+    }
+    let evidence = found
+        .iter()
+        .map(|path| EvidenceItem {
+            kind: "manifest".to_string(),
+            path: path.clone(),
+        })
+        .chain(lockfiles.iter().map(|path| EvidenceItem {
+            kind: "lockfile".to_string(),
+            path: path.clone(),
+        }))
+        .collect();
+    let _ = root;
+    Some(Component {
+        path: relative.to_string(),
+        ecosystem: Ecosystem::Python,
+        tool: Some(tool.to_string()),
+        manifests: found,
+        lockfiles,
+        evidence,
+        workspace_packages: Vec::new(),
+    })
+}
+
+fn parse_toml_list(contents: &str, section_name: &str, key: &str) -> Vec<String> {
+    let mut section = "";
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            section = trimmed.trim_matches(['[', ']'].as_ref());
+        } else if section == section_name.trim_matches(['[', ']'].as_ref())
+            && trimmed.starts_with(&format!("{key} ="))
+        {
+            return trimmed
+                .split_once('=')
+                .map(|(_, value)| value.trim().trim_matches(['[', ']'].as_ref()))
+                .unwrap_or_default()
+                .split(',')
+                .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|item| !item.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn detect_rust_component(
+    _root: &Path,
+    path: &Path,
+    relative: &str,
+    dependencies: &mut Vec<NativeDependency>,
+) -> Option<Component> {
+    if !path.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let lockfiles = ["Cargo.lock"]
+        .iter()
+        .filter(|name| path.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let contents = fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
+    let mut section = "dependency";
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            section = if trimmed.contains("dev-dependencies") {
+                "development"
+            } else if trimmed.contains("build-dependencies") {
+                "build"
+            } else {
+                "dependency"
+            };
+        } else if let Some((name, specifier)) = trimmed.split_once('=') {
+            let name = name.trim();
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && !name.starts_with('#')
+            {
+                dependencies.push(NativeDependency {
+                    name: name.to_string(),
+                    specifier: specifier.trim().to_string(),
+                    kind: section.to_string(),
+                    ecosystem: Ecosystem::Rust,
+                    native_kind: section.to_string(),
+                });
+            }
+        }
+    }
+    let evidence = vec![EvidenceItem {
+        kind: "manifest".to_string(),
+        path: "Cargo.toml".to_string(),
+    }]
+    .into_iter()
+    .chain(lockfiles.iter().map(|path| EvidenceItem {
+        kind: "lockfile".to_string(),
+        path: path.clone(),
+    }))
+    .collect();
+    Some(Component {
+        path: relative.to_string(),
+        ecosystem: Ecosystem::Rust,
+        tool: Some("cargo".to_string()),
+        manifests: vec!["Cargo.toml".to_string()],
+        lockfiles,
+        evidence,
+        workspace_packages: parse_toml_list(&contents, "[workspace]", "members"),
+    })
+}
+
+fn detect_container_component(
+    _root: &Path,
+    path: &Path,
+    relative: &str,
+    container: &mut Option<ContainerInfo>,
+) -> Option<Component> {
+    let dockerfiles = fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name == "Dockerfile" || name.starts_with("Dockerfile.")).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    let compose_files = [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+    ]
+    .iter()
+    .filter(|name| path.join(name).is_file())
+    .map(|name| name.to_string())
+    .collect::<Vec<_>>();
+    if dockerfiles.is_empty() && compose_files.is_empty() {
+        return None;
+    }
+    let mut info = ContainerInfo {
+        dockerfiles: dockerfiles.clone(),
+        compose_files: compose_files.clone(),
+        ..Default::default()
+    };
+    for file in &dockerfiles {
+        let contents = fs::read_to_string(path.join(file)).unwrap_or_default();
+        for line in contents.lines() {
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let directive = parts.next().unwrap_or_default().to_uppercase();
+            let value = parts.next().unwrap_or_default().trim();
+            if [
+                "FROM",
+                "WORKDIR",
+                "EXPOSE",
+                "ENV",
+                "ARG",
+                "ENTRYPOINT",
+                "CMD",
+                "COPY",
+                "ADD",
+            ]
+            .contains(&directive.as_str())
+                && !value.is_empty()
+            {
+                info.directives
+                    .entry(directive)
+                    .or_default()
+                    .push(value.to_string());
+            }
+        }
+    }
+    for file in &compose_files {
+        let contents = fs::read_to_string(path.join(file)).unwrap_or_default();
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.ends_with(':')
+                && !trimmed.starts_with('-')
+                && !trimmed.starts_with('#')
+                && !trimmed.contains(' ')
+                && trimmed != "services:"
+                && !trimmed.starts_with("version")
+            {
+                info.services
+                    .push(trimmed.trim_end_matches(':').to_string());
+            }
+            if let Some(image) = trimmed.strip_prefix("image:") {
+                info.images.push(image.trim().to_string());
+            }
+        }
+    }
+    *container = Some(info);
+    let evidence = dockerfiles
+        .iter()
+        .map(|path| EvidenceItem {
+            kind: "dockerfile".to_string(),
+            path: path.clone(),
+        })
+        .chain(compose_files.iter().map(|path| EvidenceItem {
+            kind: "compose".to_string(),
+            path: path.clone(),
+        }))
+        .collect();
+    Some(Component {
+        path: relative.to_string(),
+        ecosystem: Ecosystem::Container,
+        tool: Some("docker".to_string()),
+        manifests: dockerfiles.into_iter().chain(compose_files).collect(),
+        lockfiles: Vec::new(),
+        evidence,
+        workspace_packages: Vec::new(),
     })
 }
 
@@ -635,9 +1108,29 @@ fn build_output(
                 .unwrap_or_default()
         }),
         workspaces: (command == "workspaces").then(|| WorkspaceOutput {
-            enabled: detection.workspace,
-            source: detection.workspace_source.clone(),
-            packages: detection.workspace_packages.clone(),
+            enabled: detection.workspace
+                || detection
+                    .components
+                    .iter()
+                    .any(|component| !component.workspace_packages.is_empty()),
+            source: detection.workspace_source.clone().or_else(|| {
+                detection
+                    .components
+                    .iter()
+                    .find(|component| !component.workspace_packages.is_empty())
+                    .map(|_| "Cargo.toml#[workspace]".to_string())
+            }),
+            packages: detection
+                .workspace_packages
+                .iter()
+                .cloned()
+                .chain(
+                    detection
+                        .components
+                        .iter()
+                        .flat_map(|component| component.workspace_packages.iter().cloned()),
+                )
+                .collect(),
         }),
         lock: (command == "lock").then(|| LockOutput {
             found: !detection.lockfiles.is_empty(),
@@ -645,6 +1138,17 @@ fn build_output(
             selected: manager_lockfile,
             manager: manager_name,
         }),
+        ecosystem: {
+            let mut ecosystems = detection
+                .components
+                .iter()
+                .map(|component| component.ecosystem);
+            let first = ecosystems.next();
+            first.filter(|ecosystem| ecosystems.all(|candidate| candidate == *ecosystem))
+        },
+        components: detection.components.clone(),
+        native_dependencies: detection.native_dependencies.clone(),
+        container: detection.container.clone(),
     }
 }
 
@@ -743,22 +1247,24 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
             .unwrap_or_else(|| "No workspace configuration detected".to_string()),
     });
 
+    for component in &detection.components {
+        if component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1 {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warn,
+                check: "python lockfiles",
+                message: format!(
+                    "Python project has multiple lockfiles: {}",
+                    component.lockfiles.join(", ")
+                ),
+            });
+        }
+    }
+
     diagnostics
 }
 
 fn detect_node_runtime() -> Option<String> {
-    let output = Command::new("node").arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let version = String::from_utf8(output.stdout).ok()?;
-    let trimmed = version.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    None
 }
 
 fn render_human(output: &CommandOutput) -> String {
@@ -794,6 +1300,15 @@ fn render_human(output: &CommandOutput) -> String {
         format!("Workspace     {workspace}"),
         format!("Lockfile      {lockfile}"),
     ];
+    if !output.components.is_empty() {
+        let ecosystems = output
+            .components
+            .iter()
+            .map(|component| format!("{:?}", component.ecosystem).to_lowercase())
+            .collect::<Vec<_>>();
+        lines.push(format!("Ecosystems    {}", ecosystems.join(", ")));
+        lines.push(format!("Components    {}", output.components.len()));
+    }
 
     if let Some(selected_by) = &output.manager.selected_by {
         lines.push(format!("Selected by   {selected_by}"));

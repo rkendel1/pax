@@ -1,8 +1,9 @@
 # PAX
 
-PAX is the universal package-tooling boundary for JavaScript.
+PAX is the universal, read-only project-tooling boundary.
 
-It inspects npm, pnpm, Bun, and Yarn projects through one fast Rust CLI without trying to replace the underlying package manager.
+It inspects JavaScript, Python, Rust, and Docker projects through one fast Rust
+CLI without trying to replace the underlying native tool.
 
 ## Commands
 
@@ -25,6 +26,12 @@ pax --json doctor
 - lockfile presence
 - package-manager and lockfile consistency
 - workspace configuration
+
+PAX also detects Python (`uv`, `pip`, Poetry, PDM), Rust (`cargo`), and Docker
+or Compose projects. `pax info --json` reports all detected components in a
+repository, including manifests, lockfiles, tool evidence, native dependency
+semantics, and static container services. Inspection never invokes Node,
+Python, Cargo, package managers, or the Docker daemon.
 
 `pax deps`, `pax scripts`, `pax workspaces`, and `pax lock` expose normalized
 package metadata, script definitions, workspace configuration, and lockfile

@@ -106,3 +106,53 @@ fn inspection_commands_report_package_json_data_as_json() {
         }
     }
 }
+
+#[test]
+fn info_json_detects_python_rust_and_docker_components() {
+    let root = temp_dir();
+    write(
+        &root.join("services/api/pyproject.toml"),
+        "[project]\nname = \"api\"\ndependencies = [\"pytest\"]\n",
+    );
+    write(&root.join("services/api/uv.lock"), "version = 1\n");
+    write(
+        &root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\n[dependencies]\nserde = \"1\"\n[dev-dependencies]\ncriterion = \"1\"\n",
+    );
+    write(&root.join("crates/core/Cargo.lock"), "");
+    write(
+        &root.join("Dockerfile"),
+        "FROM rust:latest\nWORKDIR /app\nEXPOSE 8080\n",
+    );
+    write(
+        &root.join("compose.yaml"),
+        "services:\n  api:\n    image: postgres:16\n  redis:\n    image: redis:7\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "info"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let components = value["components"].as_array().unwrap();
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "python" && item["tool"] == "uv")
+    );
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "rust" && item["tool"] == "cargo")
+    );
+    assert!(
+        components
+            .iter()
+            .any(|item| item["ecosystem"] == "container" && item["tool"] == "docker")
+    );
+    assert_eq!(value["container"]["services"][0], "api");
+    assert_eq!(value["container"]["images"][1], "redis:7");
+    assert_eq!(value["container"]["directives"]["WORKDIR"][0], "/app");
+}
