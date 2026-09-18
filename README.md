@@ -16,6 +16,8 @@ pax workspaces
 pax lock
 pax run dev
 pax x prettier
+pax install
+pax install react
 pax deploy --dry-run
 pax --json info
 pax --json doctor
@@ -52,6 +54,10 @@ native runner, such as `npx`, `pnpm dlx`, `bunx`, `yarn dlx`, `uvx`, or `pipx`.
 `pax x install [args...]` delegates dependency installation to the detected
 native package manager, including commands such as `pip install -r
 requirements.txt`.
+
+`pax install [package...]` is the universal installation entry point. It
+delegates both project installs and package additions to the authoritative
+ecosystem tool without reimplementing package-manager behavior.
 
 `pax deploy` detects Fly.io (`fly.toml`), Vercel (`vercel.json` or
 `.vercel/project.json`), or Netlify (`netlify.toml`) evidence and delegates to

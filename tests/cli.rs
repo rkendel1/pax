@@ -267,6 +267,41 @@ fn x_install_delegates_python_requirements_to_pip() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn install_delegates_project_and_package_installation_to_npm() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"npm@10.0.0"}"#,
+    );
+    let npm = bin.join("npm");
+    write(
+        &npm,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\nexit 0\n",
+    );
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), path.to_string_lossy());
+
+    for args in [vec!["install"], vec!["install", "react"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(&args)
+            .current_dir(&root)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let expected = if args.len() == 1 {
+            format!("{}|install|", root.display())
+        } else {
+            format!("{}|install|react", root.display())
+        };
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
 #[test]
 fn deploy_dry_run_reports_provider_evidence_and_command() {
     let root = temp_dir();

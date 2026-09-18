@@ -64,6 +64,7 @@ pub struct CliError {
 enum CommandName {
     Run,
     X,
+    Install,
     Deploy,
     Info,
     Doctor,
@@ -361,6 +362,28 @@ where
             }),
         };
     }
+    if let CommandName::Install = cli.command {
+        let command = build_install_command(&detection, &cli.run_args)?;
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+            .map_err(|error| CliError {
+                message: format!("failed to execute {}: {error}", command.program),
+                exit_code: 1,
+            })?;
+        return match status.code() {
+            Some(0) => Ok(String::new()),
+            Some(code) => Err(CliError {
+                message: String::new(),
+                exit_code: code.min(u8::MAX as i32) as u8,
+            }),
+            None => Err(CliError {
+                message: String::new(),
+                exit_code: 1,
+            }),
+        };
+    }
     if let CommandName::Deploy = cli.command {
         let selection = select_deploy_provider(&detection, cli.tool.as_deref())?;
         let (program, canonical) = selection.provider.command();
@@ -404,6 +427,7 @@ where
     let output = match cli.command {
         CommandName::Run => unreachable!(),
         CommandName::X => unreachable!(),
+        CommandName::Install => unreachable!(),
         CommandName::Deploy => unreachable!(),
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
@@ -477,7 +501,10 @@ where
                     .collect(),
             )
         }
-        [command, rest @ ..] if command == "deploy" => (CommandName::Deploy, rest.to_vec()),
+        [command, rest @ ..] if command == "deploy" =>         (CommandName::Deploy, rest.to_vec())
+        }
+        [command, rest @ ..] if command == "install" => {
+        (CommandName::Install, rest.to_vec()),
         [command] if command == "info" => (CommandName::Info, Vec::new()),
         [command] if command == "doctor" => (CommandName::Doctor, Vec::new()),
         [command] if command == "deps" => (CommandName::Deps, Vec::new()),
@@ -526,7 +553,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: pax [--json] [--tool <provider>] <run <target> [args...]|x <package> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock>"
+    "usage: pax [--json] [--tool <provider>] <run <target> [args...]|x <package> [args...]|install [package...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock>"
         .to_string()
 }
 
