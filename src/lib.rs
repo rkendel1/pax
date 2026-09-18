@@ -375,6 +375,7 @@ struct ExecutionPlan {
     runner: String,
     command: Vec<String>,
     evidence: Vec<String>,
+    working_directory: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,12 +547,30 @@ where
         let mut command_args = vec![canonical.to_string()];
         command_args.extend(cli.run_args.iter().cloned());
         if cli.dry_run {
+            let plan = ExecutionPlan {
+                operation: "deploy".to_string(),
+                ecosystem: "deployment".to_string(),
+                tool: selection.provider.name().to_string(),
+                runner: program.to_string(),
+                command: std::iter::once(program.to_string())
+                    .chain(command_args.iter().cloned())
+                    .collect(),
+                evidence: selection.evidence.clone(),
+                working_directory: detection.root.display().to_string(),
+            };
+            if cli.json {
+                return serde_json::to_string_pretty(&plan).map_err(|error| CliError {
+                    message: format!("failed to serialize execution plan: {error}"),
+                    exit_code: 1,
+                });
+            }
             return Ok(format!(
-                "provider: {}\nevidence: {}\ncommand: {} {}",
+                "ecosystem: deployment\nprovider: {}\nevidence: {}\ncommand: {} {}\nworking directory: {}",
                 selection.provider.name(),
                 selection.evidence.join(", "),
                 program,
-                command_args.join(" ")
+                command_args.join(" "),
+                detection.root.display()
             ));
         }
         let command = RunCommand {
@@ -1095,6 +1114,18 @@ where
             exit_code: 0,
         });
     }
+    if args.len() == 2
+        && args[1] == "--help"
+        && matches!(
+            args[0].as_str(),
+            "run" | "x" | "install" | "graph" | "reality" | "drift"
+        )
+    {
+        return Err(CliError {
+            message: command_usage(&args[0]),
+            exit_code: 0,
+        });
+    }
 
     let mut json = false;
     let mut dry_run = false;
@@ -1217,8 +1248,40 @@ where
 }
 
 fn usage() -> String {
-    "usage: pax [--json] [--live] [--dry-run] [--tool <tool>] [--dir <path>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock|graph|reality|drift>"
+    r#"PAX is a universal, read-only project-tooling boundary.
+
+Usage: pax [OPTIONS] COMMAND [ARGS...]
+
+Inspection:
+  info, doctor, deps, scripts, workspaces, lock
+  graph, reality, drift
+Execution (delegated to native tools):
+  run, x, install, add, remove, exec, deploy
+
+Options:
+  --dir <path>       select the project root
+  --tool <tool>      explicitly select the native tool
+  --dry-run          preview a delegated command without executing it
+  --json             emit machine-readable output for automation
+  --live             allow runtime observations for reality/drift
+  -h, --help         show this help
+  -V, --version      show the package version
+
+The v0.1 command surface is intentionally narrow. See README.md for
+selection rules, installation, platform notes, and the JSON contract."#
         .to_string()
+}
+
+fn command_usage(command: &str) -> String {
+    match command {
+        "run" => "Usage: pax run <target> [args...]\nRun a project task with the selected native tool.".to_string(),
+        "x" => "Usage: pax x <package> [args...]\nRun an ephemeral package or tool with the native runner.".to_string(),
+        "install" => "Usage: pax install [package...]\nInstall declared project dependencies or named packages.".to_string(),
+        "graph" => "Usage: pax graph [--json]\nInspect static component and dependency relationships.".to_string(),
+        "reality" => "Usage: pax reality [--live] [--json]\nCompare declared, resolved, installed, and runtime observations.".to_string(),
+        "drift" => "Usage: pax drift [--live] [--json]\nReport contradictions without repairing them.".to_string(),
+        _ => unreachable!(),
+    }
 }
 
 fn select_deploy_provider(
@@ -1510,11 +1573,17 @@ fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<
             })
         } else {
             Ok(format!(
-                "Ecosystem:   {}\nTool:        {}\nOperation:   {}\nCommand:     {}",
+                "Ecosystem:   {}\nTool:        {}\nOperation:   {}\nEvidence:    {}\nCommand:     {}\nWorking dir: {}",
                 plan.ecosystem,
                 plan.tool,
                 plan.operation,
-                plan.command.join(" ")
+                if plan.evidence.is_empty() {
+                    "none".to_string()
+                } else {
+                    plan.evidence.join(", ")
+                },
+                plan.command.join(" "),
+                plan.working_directory
             ))
         };
     }
@@ -1625,6 +1694,7 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
             .chain(command.args.iter().cloned())
             .collect(),
         evidence,
+        working_directory: command.working_directory.display().to_string(),
     }
 }
 
@@ -1723,10 +1793,16 @@ fn dispatch_project_install(
                 .iter()
                 .map(|plan| {
                     format!(
-                        "{}  {}   {}",
+                        "Ecosystem: {}\nTool: {}\nEvidence: {}\nCommand: {}\nWorking dir: {}",
                         plan.ecosystem,
                         plan.tool,
-                        plan.command.join(" ")
+                        if plan.evidence.is_empty() {
+                            "none".to_string()
+                        } else {
+                            plan.evidence.join(", ")
+                        },
+                        plan.command.join(" "),
+                        plan.working_directory
                     )
                 })
                 .chain(std::iter::once(format!("{} components", plans.len())))

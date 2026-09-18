@@ -5,6 +5,11 @@ PAX is the universal, read-only project-tooling boundary.
 It inspects JavaScript, Python, Rust, and Docker projects through one fast Rust
 CLI without trying to replace the underlying native tool.
 
+“Read-only” describes PAX's observation model. Delegated commands such as
+`pax run`, `pax install`, `pax add`, `pax remove`, and `pax deploy` execute the
+selected native tool and may mutate project state exactly as that tool normally
+would.
+
 ## Commands
 
 ```bash
@@ -91,6 +96,8 @@ The command vocabulary is intentionally narrow:
 - `pax add` / `pax remove` — dependency mutations
 - `pax exec` — exact native command escape hatch
 
+This is the complete v0.1 API surface; no additional commands are implied.
+
 PAX resolves the ecosystem tool and delegates to it; it does not replace npm,
 pnpm, Yarn, Bun, uv, pip, Poetry, PDM, Cargo, or Docker. Use `--tool` for an
 explicit override and `--dry-run` (optionally with `--json`) to inspect the
@@ -127,6 +134,29 @@ JSON output is a versioned machine-readable contract. Observation statuses are
 `match`, `drift`, `ambiguous`, or `unknown`; unknown evidence is never promoted
 to drift. Exit code `0` means success/match, `1` means delegated failure or
 drift, and `2` means invalid input or ambiguity.
+JSON is intended for automation and agents; human-readable diagnostics are
+written separately and are never mixed into JSON output.
+
+## Installation
+
+The v0.1 release is distributed as a source build until release artifacts are
+published:
+
+```bash
+git clone https://github.com/rkendel1/pax.git
+cd pax
+cargo install --path .
+pax --version
+```
+
+Upgrade by pulling the desired revision and rerunning `cargo install --path .`.
+Uninstall with `cargo uninstall pax`. To build without installing, use
+`cargo build --release`; the binary is `target/release/pax`.
+
+PAX uses native executable names and path handling supplied by the operating
+system. Linux and macOS are the primary tested environments; Windows support
+depends on the corresponding native tools being available on `PATH`, and
+shell-specific behavior remains the responsibility of the delegated tool.
 
 ## Detection model
 
