@@ -64,6 +64,7 @@ pub struct CliError {
 enum CommandName {
     Run,
     X,
+    Deploy,
     Info,
     Doctor,
     Deps,
@@ -264,6 +265,46 @@ struct RunCommand {
     working_directory: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeployProvider {
+    Fly,
+    Vercel,
+    Netlify,
+}
+
+impl DeployProvider {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fly => "fly",
+            Self::Vercel => "vercel",
+            Self::Netlify => "netlify",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fly" | "flyctl" => Some(Self::Fly),
+            "vercel" => Some(Self::Vercel),
+            "netlify" => Some(Self::Netlify),
+            _ => None,
+        }
+    }
+
+    fn command(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Fly => ("fly", "deploy"),
+            Self::Vercel => ("vercel", "deploy"),
+            Self::Netlify => ("netlify", "deploy"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeploySelection {
+    provider: DeployProvider,
+    evidence: Vec<String>,
+}
+
 pub fn run<I, S>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -320,10 +361,50 @@ where
             }),
         };
     }
+    if let CommandName::Deploy = cli.command {
+        let selection = select_deploy_provider(&detection, cli.tool.as_deref())?;
+        let (program, canonical) = selection.provider.command();
+        let mut command_args = vec![canonical.to_string()];
+        command_args.extend(cli.run_args.iter().cloned());
+        if cli.dry_run {
+            return Ok(format!(
+                "provider: {}\nevidence: {}\ncommand: {} {}",
+                selection.provider.name(),
+                selection.evidence.join(", "),
+                program,
+                command_args.join(" ")
+            ));
+        }
+        let command = RunCommand {
+            program: program.to_string(),
+            args: command_args,
+            working_directory: detection.root.clone(),
+        };
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+            .map_err(|error| CliError {
+                message: format!("failed to execute {}: {error}", command.program),
+                exit_code: 1,
+            })?;
+        return match status.code() {
+            Some(0) => Ok(String::new()),
+            Some(code) => Err(CliError {
+                message: String::new(),
+                exit_code: code.min(u8::MAX as i32) as u8,
+            }),
+            None => Err(CliError {
+                message: String::new(),
+                exit_code: 1,
+            }),
+        };
+    }
 
     let output = match cli.command {
         CommandName::Run => unreachable!(),
         CommandName::X => unreachable!(),
+        CommandName::Deploy => unreachable!(),
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
         CommandName::Deps => build_output("deps", detection, false),
@@ -346,6 +427,8 @@ struct ParsedCli {
     command: CommandName,
     json: bool,
     run_args: Vec<String>,
+    tool: Option<String>,
+    dry_run: bool,
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli, CliError>
@@ -360,6 +443,20 @@ where
 
     let json = args.iter().any(|arg| arg == "--json");
     args.retain(|arg| arg != "--json");
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    args.retain(|arg| arg != "--dry-run");
+    let tool = if let Some(index) = args.iter().position(|arg| arg == "--tool") {
+        if index + 1 >= args.len() {
+            return Err(CliError {
+                message: "pax --tool requires a provider".to_string(),
+                exit_code: 2,
+            });
+        }
+        args.remove(index);
+        Some(args.remove(index))
+    } else {
+        None
+    };
 
     let (command, run_args) = match args.as_slice() {
         [command, target, rest @ ..] if command == "run" || command == "x" => {
@@ -380,6 +477,7 @@ where
                     .collect(),
             )
         }
+        [command, rest @ ..] if command == "deploy" => (CommandName::Deploy, rest.to_vec()),
         [command] if command == "info" => (CommandName::Info, Vec::new()),
         [command] if command == "doctor" => (CommandName::Doctor, Vec::new()),
         [command] if command == "deps" => (CommandName::Deps, Vec::new()),
@@ -395,6 +493,12 @@ where
         [command] if command == "x" => {
             return Err(CliError {
                 message: format!("pax x requires a package\n\n{}", usage()),
+                exit_code: 2,
+            });
+        }
+        [command] if command == "deploy" => {
+            return Err(CliError {
+                message: format!("pax deploy requires a provider\n\n{}", usage()),
                 exit_code: 2,
             });
         }
@@ -416,12 +520,69 @@ where
         command,
         json,
         run_args,
+        tool,
+        dry_run,
     })
 }
 
 fn usage() -> String {
-    "usage: pax [--json] <run <target> [args...]|x <package> [args...]|info|doctor|deps|scripts|workspaces|lock>"
+    "usage: pax [--json] [--tool <provider>] <run <target> [args...]|x <package> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock>"
         .to_string()
+}
+
+fn select_deploy_provider(
+    detection: &RepositoryDetection,
+    requested: Option<&str>,
+) -> Result<DeploySelection, CliError> {
+    let candidates = [
+        (DeployProvider::Fly, "fly.toml"),
+        (DeployProvider::Vercel, "vercel.json"),
+        (DeployProvider::Vercel, ".vercel/project.json"),
+        (DeployProvider::Netlify, "netlify.toml"),
+    ];
+    let mut detected = Vec::new();
+    for (provider, evidence) in candidates {
+        if detection.root.join(evidence).is_file()
+            && !detected
+                .iter()
+                .any(|(found, _): &(DeployProvider, String)| *found == provider)
+        {
+            detected.push((provider, evidence.to_string()));
+        }
+    }
+    if let Some(requested) = requested {
+        let provider = DeployProvider::parse(requested).ok_or_else(|| CliError {
+            message: format!("unsupported deployment provider: {requested}"),
+            exit_code: 2,
+        })?;
+        let evidence = detected
+            .iter()
+            .filter(|(found, _)| *found == provider)
+            .map(|(_, evidence)| evidence.clone())
+            .collect();
+        return Ok(DeploySelection { provider, evidence });
+    }
+    match detected.as_slice() {
+        [(provider, evidence)] => Ok(DeploySelection {
+            provider: *provider,
+            evidence: vec![evidence.clone()],
+        }),
+        [] => Err(CliError {
+            message: "could not detect a deployment provider (use --tool <provider>)".to_string(),
+            exit_code: 1,
+        }),
+        _ => Err(CliError {
+            message: format!(
+                "ambiguous deployment providers: {}",
+                detected
+                    .iter()
+                    .map(|(provider, evidence)| format!("{} ({evidence})", provider.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            exit_code: 2,
+        }),
+    }
 }
 
 fn build_x_command(

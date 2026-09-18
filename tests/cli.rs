@@ -266,3 +266,65 @@ fn x_install_delegates_python_requirements_to_pip() {
         format!("{}|install|-r|requirements.txt", root.display())
     );
 }
+
+#[test]
+fn deploy_dry_run_reports_provider_evidence_and_command() {
+    let root = temp_dir();
+    write(&root.join("fly.toml"), "app = \"sample\"\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["deploy", "--dry-run", "--region", "iad"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("provider: fly"));
+    assert!(stdout.contains("evidence: fly.toml"));
+    assert!(stdout.contains("command: fly deploy --region iad"));
+}
+
+#[test]
+fn deploy_rejects_ambiguous_provider_evidence() {
+    let root = temp_dir();
+    write(&root.join("fly.toml"), "app = \"sample\"\n");
+    write(&root.join("vercel.json"), "{}\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["deploy", "--dry-run"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("ambiguous deployment providers")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_delegates_with_explicit_tool_and_preserves_exit_code() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    let fly = bin.join("fly");
+    write(
+        &fly,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\nexit 9\n",
+    );
+    fs::set_permissions(&fly, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--tool", "fly", "deploy", "--remote-only"])
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}|deploy|--remote-only", root.display())
+    );
+}
