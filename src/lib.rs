@@ -427,6 +427,22 @@ where
         message: format!("failed to determine current directory: {error}"),
         exit_code: 1,
     })?;
+    let working_directory = cli
+        .dir
+        .as_deref()
+        .map(|dir| {
+            let path = if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                cwd.join(dir)
+            };
+            fs::canonicalize(&path).map_err(|error| CliError {
+                message: format!("invalid project directory {}: {error}", path.display()),
+                exit_code: 2,
+            })
+        })
+        .transpose()?
+        .unwrap_or(cwd);
 
     if let CommandName::Exec = cli.command {
         let (program, args) = cli.run_args.split_first().ok_or_else(|| CliError {
@@ -437,13 +453,13 @@ where
             RunCommand {
                 program: program.clone(),
                 args: args.to_vec(),
-                working_directory: cwd,
+                working_directory,
             },
             cli.dry_run,
             cli.json,
         );
     }
-    let detection = detect_repository(&cwd)?;
+    let detection = detect_repository(&working_directory)?;
     if matches!(
         cli.command,
         CommandName::Graph | CommandName::Reality | CommandName::Drift
@@ -472,12 +488,37 @@ where
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             > 1
+        || cli.tool.is_none()
+            && matches!(
+                cli.command,
+                CommandName::Run
+                    | CommandName::X
+                    | CommandName::Install
+                    | CommandName::Add
+                    | CommandName::Remove
+            )
+            && detection
+                .components
+                .iter()
+                .any(|component| {
+                    component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
+                })
     {
         return Err(CliError {
-            message: format!(
-                "multiple JavaScript package managers detected: {}\nuse --tool npm, --tool pnpm, --tool yarn, or --tool bun",
-                detection.lockfiles.join(", ")
-            ),
+            message: if detection
+                .components
+                .iter()
+                .any(|component| {
+                    component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
+                })
+            {
+                "ambiguous Python toolchain: multiple lockfiles detected; use --tool uv, --tool poetry, --tool pdm, or --tool pip".to_string()
+            } else {
+                format!(
+                    "multiple JavaScript package managers detected: {}\nuse --tool npm, --tool pnpm, --tool yarn, or --tool bun",
+                    detection.lockfiles.join(", ")
+                )
+            },
             exit_code: 2,
         });
     }
@@ -1035,6 +1076,7 @@ struct ParsedCli {
     json: bool,
     run_args: Vec<String>,
     tool: Option<String>,
+    dir: Option<PathBuf>,
     dry_run: bool,
     live: bool,
 }
@@ -1049,24 +1091,45 @@ where
         args.remove(0);
     }
 
-    let json = args.iter().any(|arg| arg == "--json");
-    args.retain(|arg| arg != "--json");
-    let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    args.retain(|arg| arg != "--dry-run");
-    let live = args.iter().any(|arg| arg == "--live");
-    args.retain(|arg| arg != "--live");
-    let tool = if let Some(index) = args.iter().position(|arg| arg == "--tool") {
-        if index + 1 >= args.len() {
-            return Err(CliError {
-                message: "pax --tool requires a provider".to_string(),
-                exit_code: 2,
-            });
+    let mut json = false;
+    let mut dry_run = false;
+    let mut live = false;
+    let mut tool = None;
+    let mut dir = None;
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut index = 0;
+    let mut options = true;
+    while index < args.len() {
+        let arg = &args[index];
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+            continue;
         }
-        args.remove(index);
-        Some(args.remove(index))
-    } else {
-        None
-    };
+        if options && arg == "--json" {
+            json = true;
+        } else if options && arg == "--dry-run" {
+            dry_run = true;
+        } else if options && arg == "--live" {
+            live = true;
+        } else if options && arg == "--tool" {
+            index += 1;
+            tool = Some(args.get(index).ok_or_else(|| CliError {
+                message: "pax --tool requires a tool".to_string(),
+                exit_code: 2,
+            })?.clone());
+        } else if options && arg == "--dir" {
+            index += 1;
+            dir = Some(PathBuf::from(args.get(index).ok_or_else(|| CliError {
+                message: "pax --dir requires a directory".to_string(),
+                exit_code: 2,
+            })?));
+        } else {
+            filtered.push(arg.clone());
+        }
+        index += 1;
+    }
+    args = filtered;
 
     let (command, run_args) = match args.as_slice() {
         [command, target, rest @ ..] if command == "run" || command == "x" => {
@@ -1138,6 +1201,7 @@ where
         json,
         run_args,
         tool,
+        dir,
         dry_run,
         live,
     })
@@ -1596,22 +1660,18 @@ fn build_project_install_commands(
                 "poetry" => ("poetry", vec!["install".to_string()]),
                 "pdm" => ("pdm", vec!["install".to_string()]),
                 "pip" => {
-                    let requirements = component
+                    if let Some(requirements) = component
                         .manifests
                         .iter()
                         .find(|path| path.ends_with(".txt"))
-                        .cloned()
-                        .ok_or_else(|| CliError {
-                            message: format!(
-                                "Python component {} has no requirements file",
-                                component.path
-                            ),
-                            exit_code: 1,
-                        })?;
-                    (
-                        "pip",
-                        vec!["install".to_string(), "-r".to_string(), requirements],
-                    )
+                    {
+                        (
+                            "pip",
+                            vec!["install".to_string(), "-r".to_string(), requirements.clone()],
+                        )
+                    } else {
+                        ("pip", vec!["install".to_string(), ".".to_string()])
+                    }
                 }
                 _ => continue,
             },
@@ -1699,15 +1759,49 @@ fn build_run_command(
     })?;
     let extra_args = &run_args[1..];
 
-    let manager = override_tool
-        .and_then(PackageManager::parse)
-        .map(|name| DetectedManager {
-            name,
-            version: None,
-            lockfile: None,
-            selected_by: "explicit --tool override".to_string(),
-        })
-        .or_else(|| detection.manager.clone());
+    if let Some(tool) = override_tool {
+        if let Some(name) = PackageManager::parse(tool) {
+            let mut args = vec!["run".to_string(), target.clone()];
+            args.extend(extra_args.iter().cloned());
+            return Ok(RunCommand {
+                program: name.display_name().to_string(),
+                args,
+                working_directory: detection.root.clone(),
+            });
+        }
+        let mut args = Vec::new();
+        let program = match tool {
+            "uv" | "poetry" | "pdm" => {
+                args.push("run".to_string());
+                tool
+            }
+            "cargo" => {
+                args.extend(["run".to_string(), "--bin".to_string(), target.clone(), "--".to_string()]);
+                "cargo"
+            }
+            "docker" => {
+                args.extend(["compose".to_string(), "run".to_string(), "--rm".to_string(), target.clone()]);
+                "docker"
+            }
+            _ => {
+                return Err(CliError {
+                    message: format!("unsupported execution tool: {tool}"),
+                    exit_code: 2,
+                });
+            }
+        };
+        if !matches!(tool, "cargo" | "docker") {
+            args.push(target.clone());
+        }
+        args.extend(extra_args.iter().cloned());
+        return Ok(RunCommand {
+            program: program.to_string(),
+            args,
+            working_directory: detection.root.clone(),
+        });
+    }
+
+    let manager = detection.manager.clone();
     if let Some(manager) = manager.as_ref() {
         let mut args = vec!["run".to_string(), target.clone()];
         args.extend(extra_args.iter().cloned());
