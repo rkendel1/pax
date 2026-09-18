@@ -139,24 +139,39 @@ written separately and are never mixed into JSON output.
 
 ## Installation
 
-The v0.1 release is distributed as a source build until release artifacts are
-published:
+Release tags publish native archives containing the `pax` executable. Download
+the archive for your platform from the
+[GitHub Releases](https://github.com/rkendel1/pax/releases) page, extract it,
+and put the executable on `PATH`. No runtime other than the operating system is
+required:
 
 ```bash
-git clone https://github.com/rkendel1/pax.git
-cd pax
-cargo install --path .
 pax --version
+pax --help
+pax info
 ```
 
-Upgrade by pulling the desired revision and rerunning `cargo install --path .`.
-Uninstall with `cargo uninstall pax`. To build without installing, use
-`cargo build --release`; the binary is `target/release/pax`.
+The v0.1 release target matrix is intentionally explicit:
+
+| Platform | Rust target |
+| --- | --- |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+These are the supported release artifacts; other platforms are not advertised
+until they have reliable release builds and tests. Building from source remains
+available for contributors with Rust installed:
+
+```bash
+cargo install --path .
+```
 
 PAX uses native executable names and path handling supplied by the operating
-system. Linux and macOS are the primary tested environments; Windows support
-depends on the corresponding native tools being available on `PATH`, and
-shell-specific behavior remains the responsibility of the delegated tool.
+system. Delegated tools remain external authorities and must be installed
+separately when a command needs them.
 
 ## Detection model
 
