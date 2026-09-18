@@ -298,7 +298,11 @@ fn install_delegates_project_and_package_installation_to_npm() {
         } else {
             format!("{}|install|react", root.display())
         };
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .ends_with(&expected)
+        );
     }
 }
 
@@ -385,6 +389,51 @@ fn exec_forwards_exact_command_without_detection() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_orchestrates_declared_mixed_project_components() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"web","packageManager":"npm@10.0.0"}"#,
+    );
+    write(
+        &root.join("services/api/pyproject.toml"),
+        "[project]\nname = \"api\"\n",
+    );
+    write(&root.join("services/api/uv.lock"), "version = 1\n");
+    write(
+        &root.join("crates/worker/Cargo.toml"),
+        "[package]\nname = \"worker\"\nversion = \"0.1.0\"\n",
+    );
+    write(&root.join("crates/worker/Cargo.lock"), "");
+    for tool in ["npm", "uv", "cargo"] {
+        let path = bin.join(tool);
+        write(
+            &path,
+            "#!/bin/sh\nprintf '%s:%s\\n' \"$PWD\" \"$1\"\nexit 0\n",
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("install")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("PAX install: 3 components"));
+    assert!(stdout.contains(":install"));
+    assert!(stdout.contains(":sync"));
+    assert!(stdout.contains(":fetch"));
 }
 
 #[test]

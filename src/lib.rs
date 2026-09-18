@@ -404,6 +404,10 @@ where
         return dispatch_execution(command, cli.dry_run, cli.json);
     }
     if let CommandName::Install = cli.command {
+        if cli.run_args.is_empty() {
+            let commands = build_project_install_commands(&detection, cli.tool.as_deref())?;
+            return dispatch_project_install(commands, cli.dry_run, cli.json);
+        }
         let command = build_install_command(&detection, &cli.run_args, cli.tool.as_deref())?;
         return dispatch_execution(command, cli.dry_run, cli.json);
     }
@@ -734,6 +738,7 @@ fn build_install_command(
         if !matches!(tool, "npm" | "pnpm" | "bun" | "yarn") {
             return build_python_install_command(detection, install_args, tool);
         }
+
         let mut args = vec!["install".to_string()];
         args.extend(install_args.iter().cloned());
         return Ok(RunCommand {
@@ -997,6 +1002,139 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
             .collect(),
         evidence,
     }
+}
+
+fn build_project_install_commands(
+    detection: &RepositoryDetection,
+    override_tool: Option<&str>,
+) -> Result<Vec<RunCommand>, CliError> {
+    let mut commands = Vec::new();
+    if detection.package_json {
+        let tool = override_tool
+            .or_else(|| {
+                detection
+                    .manager
+                    .as_ref()
+                    .map(|manager| manager.name.display_name())
+            })
+            .ok_or_else(|| CliError {
+                message: "could not determine the JavaScript package manager; use --tool"
+                    .to_string(),
+                exit_code: 1,
+            })?;
+        if !matches!(tool, "npm" | "pnpm" | "yarn" | "bun") {
+            return Err(CliError {
+                message: format!("unsupported JavaScript package manager: {tool}"),
+                exit_code: 2,
+            });
+        }
+        commands.push(RunCommand {
+            program: tool.to_string(),
+            args: vec!["install".to_string()],
+            working_directory: detection.root.clone(),
+        });
+    }
+    for component in &detection.components {
+        let Some(tool) = component.tool.as_deref() else {
+            continue;
+        };
+        let working_directory = detection.root.join(&component.path);
+        let command = match component.ecosystem {
+            Ecosystem::Python => match tool {
+                "uv" => ("uv", vec!["sync".to_string()]),
+                "poetry" => ("poetry", vec!["install".to_string()]),
+                "pdm" => ("pdm", vec!["install".to_string()]),
+                "pip" => {
+                    let requirements = component
+                        .manifests
+                        .iter()
+                        .find(|path| path.ends_with(".txt"))
+                        .cloned()
+                        .ok_or_else(|| CliError {
+                            message: format!(
+                                "Python component {} has no requirements file",
+                                component.path
+                            ),
+                            exit_code: 1,
+                        })?;
+                    (
+                        "pip",
+                        vec!["install".to_string(), "-r".to_string(), requirements],
+                    )
+                }
+                _ => continue,
+            },
+            Ecosystem::Rust => ("cargo", vec!["fetch".to_string()]),
+            Ecosystem::JavaScript | Ecosystem::Container => continue,
+        };
+        commands.push(RunCommand {
+            program: command.0.to_string(),
+            args: command.1,
+            working_directory,
+        });
+    }
+    if commands.is_empty() {
+        return Err(CliError {
+            message: "no declared installable project components detected".to_string(),
+            exit_code: 1,
+        });
+    }
+    Ok(commands)
+}
+
+fn dispatch_project_install(
+    commands: Vec<RunCommand>,
+    dry_run: bool,
+    json: bool,
+) -> Result<String, CliError> {
+    if dry_run {
+        let plans = commands.iter().map(execution_plan).collect::<Vec<_>>();
+        return if json {
+            serde_json::to_string_pretty(&plans).map_err(|error| CliError {
+                message: format!("failed to serialize execution plans: {error}"),
+                exit_code: 1,
+            })
+        } else {
+            Ok(plans
+                .iter()
+                .map(|plan| {
+                    format!(
+                        "{}  {}   {}",
+                        plan.ecosystem,
+                        plan.tool,
+                        plan.command.join(" ")
+                    )
+                })
+                .chain(std::iter::once(format!("{} components", plans.len())))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+    }
+    println!("PAX install: {} components", commands.len());
+    let mut first_failure = None;
+    for command in commands {
+        println!("→ {}", command.args.join(" "));
+        match Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_directory)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                first_failure.get_or_insert(status.code().unwrap_or(1));
+            }
+            Err(error) => {
+                eprintln!("failed to execute {}: {error}", command.program);
+                first_failure.get_or_insert(1);
+            }
+        }
+    }
+    first_failure.map_or(Ok(String::new()), |code| {
+        Err(CliError {
+            message: String::new(),
+            exit_code: code.min(u8::MAX as i32) as u8,
+        })
+    })
 }
 
 fn build_run_command(
