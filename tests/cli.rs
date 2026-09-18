@@ -358,6 +358,33 @@ fn dry_run_produces_machine_readable_execution_plan() {
     assert_eq!(value["tool"], "pnpm");
     assert_eq!(value["command"][0], "pnpm");
     assert_eq!(value["command"][1], "dlx");
+    assert_eq!(value["working_directory"], root.to_str().unwrap());
+    assert!(
+        value["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "package.json#packageManager")
+    );
+}
+
+#[test]
+fn command_help_describes_supported_execution_and_observation_commands() {
+    for (command, expected) in [
+        ("run", "Run a project task"),
+        ("x", "ephemeral package"),
+        ("install", "Install declared"),
+        ("graph", "static component"),
+        ("reality", "runtime observations"),
+        ("drift", "contradictions"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command} help failed");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
 }
 
 #[test]
@@ -450,6 +477,23 @@ fn deploy_dry_run_reports_provider_evidence_and_command() {
     assert!(stdout.contains("provider: fly"));
     assert!(stdout.contains("evidence: fly.toml"));
     assert!(stdout.contains("command: fly deploy --region iad"));
+}
+
+#[test]
+fn deploy_json_dry_run_is_an_execution_plan() {
+    let root = temp_dir();
+    write(&root.join("fly.toml"), "app = \"sample\"\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dry-run", "deploy"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ecosystem"], "deployment");
+    assert_eq!(value["tool"], "fly");
+    assert_eq!(value["command"][1], "deploy");
+    assert_eq!(value["working_directory"], root.to_str().unwrap());
 }
 
 #[test]
