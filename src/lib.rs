@@ -83,6 +83,9 @@ enum CommandName {
     Scripts,
     Workspaces,
     Lock,
+    Graph,
+    Reality,
+    Drift,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -217,6 +220,83 @@ struct ManagerInfo {
 struct CommandResult {
     summary: String,
     runtime: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GraphNode {
+    id: String,
+    kind: String,
+    ecosystem: Ecosystem,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GraphEdge {
+    from: String,
+    to: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GraphEvidence {
+    edge: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GraphOutput {
+    schema_version: &'static str,
+    command: &'static str,
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    evidence: Vec<GraphEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RealityObservation {
+    subject: String,
+    status: String,
+    source: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RealityLayer {
+    observations: Vec<RealityObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RealityOutput {
+    schema_version: &'static str,
+    command: &'static str,
+    live: bool,
+    declared: RealityLayer,
+    resolved: RealityLayer,
+    installed: RealityLayer,
+    runtime: RealityLayer,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DriftItem {
+    subject: String,
+    status: String,
+    expected: String,
+    actual: String,
+    evidence: Vec<DriftEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DriftEvidence {
+    source: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DriftOutput {
+    schema_version: &'static str,
+    command: &'static str,
+    live: bool,
+    status: String,
+    issues: Vec<DriftItem>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -364,6 +444,12 @@ where
         );
     }
     let detection = detect_repository(&cwd)?;
+    if matches!(
+        cli.command,
+        CommandName::Graph | CommandName::Reality | CommandName::Drift
+    ) {
+        return dispatch_observation(&detection, cli.command, cli.live, cli.json);
+    }
     if cli.tool.is_none()
         && matches!(
             cli.command,
@@ -474,6 +560,7 @@ where
         CommandName::Scripts => build_output("scripts", detection, false),
         CommandName::Workspaces => build_output("workspaces", detection, false),
         CommandName::Lock => build_output("lock", detection, false),
+        CommandName::Graph | CommandName::Reality | CommandName::Drift => unreachable!(),
     };
 
     if cli.json {
@@ -486,12 +573,470 @@ where
     }
 }
 
+fn dispatch_observation(
+    detection: &RepositoryDetection,
+    command: CommandName,
+    live: bool,
+    json: bool,
+) -> Result<String, CliError> {
+    match command {
+        CommandName::Graph => {
+            let output = build_graph(detection);
+            if json {
+                serde_json::to_string_pretty(&output).map_err(|error| CliError {
+                    message: error.to_string(),
+                    exit_code: 1,
+                })
+            } else {
+                Ok(render_graph(&output))
+            }
+        }
+        CommandName::Reality => {
+            let output = build_reality(detection, live);
+            if json {
+                serde_json::to_string_pretty(&output).map_err(|error| CliError {
+                    message: error.to_string(),
+                    exit_code: 1,
+                })
+            } else {
+                Ok(render_reality(&output))
+            }
+        }
+        CommandName::Drift => {
+            let output = build_drift(detection, live);
+            if json {
+                serde_json::to_string_pretty(&output).map_err(|error| CliError {
+                    message: error.to_string(),
+                    exit_code: 1,
+                })
+            } else {
+                Ok(render_drift(&output))
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut evidence = Vec::new();
+    if let Some(data) = &detection.package_json_data {
+        for (dependencies, kind) in [
+            (&data.dependencies, "runtime-dependency"),
+            (&data.dev_dependencies, "development-dependency"),
+            (&data.optional_dependencies, "optional-dependency"),
+            (&data.peer_dependencies, "peer-dependency"),
+        ] {
+            for name in dependencies.keys() {
+                nodes.push(GraphNode {
+                    id: name.clone(),
+                    kind: "dependency".to_string(),
+                    ecosystem: Ecosystem::JavaScript,
+                });
+                edges.push(GraphEdge {
+                    from: ".".to_string(),
+                    to: name.clone(),
+                    kind: kind.to_string(),
+                });
+                evidence.push(GraphEvidence {
+                    edge: format!(". -> {name}"),
+                    evidence: vec!["package.json".to_string()],
+                });
+            }
+        }
+    }
+    for component in &detection.components {
+        nodes.push(GraphNode {
+            id: component.path.clone(),
+            kind: "component".to_string(),
+            ecosystem: component.ecosystem,
+        });
+        for dependency in detection
+            .native_dependencies
+            .iter()
+            .filter(|dependency| dependency.ecosystem == component.ecosystem)
+        {
+            let id = dependency.name.clone();
+            nodes.push(GraphNode {
+                id: id.clone(),
+                kind: "dependency".to_string(),
+                ecosystem: dependency.ecosystem,
+            });
+            let kind = match dependency.kind.as_str() {
+                "development" | "dev" => "development-dependency",
+                "build" => "build-dependency",
+                "optional" => "optional-dependency",
+                "peer" => "peer-dependency",
+                _ => "runtime-dependency",
+            }
+            .to_string();
+            edges.push(GraphEdge {
+                from: component.path.clone(),
+                to: id.clone(),
+                kind: kind.clone(),
+            });
+            evidence.push(GraphEvidence {
+                edge: format!("{} -> {}", component.path, id),
+                evidence: component
+                    .manifests
+                    .first()
+                    .map(|manifest| {
+                        if component.path == "." {
+                            manifest.clone()
+                        } else {
+                            format!("{}/{}", component.path, manifest)
+                        }
+                    })
+                    .into_iter()
+                    .collect(),
+            });
+        }
+    }
+    nodes.sort_by(|a, b| a.id.cmp(&b.id).then(a.kind.cmp(&b.kind)));
+    nodes.dedup_by(|a, b| a.id == b.id && a.kind == b.kind);
+    edges.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
+    edges.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
+    evidence.sort_by(|a, b| a.edge.cmp(&b.edge));
+    GraphOutput {
+        schema_version: "1",
+        command: "graph",
+        nodes,
+        edges,
+        evidence,
+    }
+}
+
+fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
+    let declared = detection
+        .components
+        .iter()
+        .map(|component| RealityObservation {
+            subject: component.path.clone(),
+            status: "present".to_string(),
+            source: "filesystem".to_string(),
+            evidence: component
+                .manifests
+                .iter()
+                .map(|path| {
+                    if component.path == "." {
+                        path.clone()
+                    } else {
+                        format!("{}/{}", component.path, path)
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let resolved = detection
+        .components
+        .iter()
+        .flat_map(|component| {
+            component.lockfiles.iter().map(|path| RealityObservation {
+                subject: component.path.clone(),
+                status: "present".to_string(),
+                source: "filesystem".to_string(),
+                evidence: vec![if component.path == "." {
+                    path.clone()
+                } else {
+                    format!("{}/{}", component.path, path)
+                }],
+            })
+        })
+        .collect();
+    let installed = detection
+        .components
+        .iter()
+        .map(|component| {
+            let path = detection.root.join(&component.path);
+            let (status, evidence) = match component.ecosystem {
+                Ecosystem::JavaScript => {
+                    let installed = path.join("node_modules").is_dir();
+                    (
+                        if installed { "present" } else { "absent" },
+                        vec!["node_modules/".to_string()],
+                    )
+                }
+                Ecosystem::Rust => {
+                    if path.join("target").is_dir() {
+                        ("present", vec!["target/".to_string()])
+                    } else {
+                        ("unknown", Vec::new())
+                    }
+                }
+                Ecosystem::Python => {
+                    let environment = [".venv", "venv", ".env"]
+                        .iter()
+                        .find(|name| path.join(name).is_dir());
+                    match environment {
+                        Some(name) => ("present", vec![format!("{name}/")]),
+                        None => ("unknown", Vec::new()),
+                    }
+                }
+                Ecosystem::Container => ("unknown", Vec::new()),
+            };
+            RealityObservation {
+                subject: component.path.clone(),
+                status: status.to_string(),
+                source: "filesystem".to_string(),
+                evidence,
+            }
+        })
+        .collect();
+    let runtime = if live {
+        detection
+            .components
+            .iter()
+            .filter(|component| component.ecosystem == Ecosystem::Container)
+            .map(|component| RealityObservation {
+                subject: component.path.clone(),
+                status: "unknown".to_string(),
+                source: "docker".to_string(),
+                evidence: vec!["docker compose ps".to_string()],
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    RealityOutput {
+        schema_version: "1",
+        command: "reality",
+        live,
+        declared: RealityLayer {
+            observations: declared,
+        },
+        resolved: RealityLayer {
+            observations: resolved,
+        },
+        installed: RealityLayer {
+            observations: installed,
+        },
+        runtime: RealityLayer {
+            observations: runtime,
+        },
+    }
+}
+
+fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
+    let mut issues = Vec::new();
+    let package_manager = detection
+        .package_json_data
+        .as_ref()
+        .and_then(|data| data.package_manager_field.as_deref())
+        .and_then(parse_package_manager_field)
+        .map(|(manager, _)| manager);
+    let js_locks = detection
+        .lockfiles
+        .iter()
+        .filter_map(|file| manager_from_lockfile(file).map(|manager| (manager, file)))
+        .collect::<Vec<_>>();
+    if let Some(manager) = package_manager {
+        if js_locks.iter().any(|(found, _)| *found != manager) {
+            issues.push(DriftItem {
+                subject: ".".to_string(),
+                status: "drift".to_string(),
+                expected: manager.to_string(),
+                actual: js_locks
+                    .iter()
+                    .map(|(_, file)| file.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                evidence: js_locks
+                    .iter()
+                    .map(|(_, file)| DriftEvidence {
+                        source: (*file).clone(),
+                        kind: "resolved".to_string(),
+                    })
+                    .chain(std::iter::once(DriftEvidence {
+                        source: "package.json".to_string(),
+                        kind: "declared".to_string(),
+                    }))
+                    .collect(),
+            });
+        }
+    } else if js_locks
+        .iter()
+        .map(|(manager, _)| *manager)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1
+    {
+        issues.push(DriftItem {
+            subject: ".".to_string(),
+            status: "ambiguous".to_string(),
+            expected: "one JavaScript package-manager authority".to_string(),
+            actual: js_locks
+                .iter()
+                .map(|(_, file)| file.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            evidence: js_locks
+                .iter()
+                .map(|(_, file)| DriftEvidence {
+                    source: (*file).clone(),
+                    kind: "resolved".to_string(),
+                })
+                .collect(),
+        });
+    }
+    if let (Some(data), Some(lockfile)) = (
+        detection.package_json_data.as_ref(),
+        detection
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.lockfile.as_ref()),
+    ) {
+        let contents = fs::read_to_string(detection.root.join(lockfile)).unwrap_or_default();
+        for name in data.dependencies.keys() {
+            if !contents.contains(name) {
+                issues.push(DriftItem {
+                    subject: format!("./{name}"),
+                    status: "drift".to_string(),
+                    expected: "declared dependency in resolved lockfile".to_string(),
+                    actual: format!("{name} missing from {lockfile}"),
+                    evidence: vec![
+                        DriftEvidence {
+                            source: "package.json".to_string(),
+                            kind: "declared".to_string(),
+                        },
+                        DriftEvidence {
+                            source: lockfile.clone(),
+                            kind: "resolved".to_string(),
+                        },
+                    ],
+                });
+            }
+        }
+    }
+    for component in &detection.components {
+        if component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1 {
+            issues.push(DriftItem {
+                subject: component.path.clone(),
+                status: "ambiguous".to_string(),
+                expected: "one Python resolution authority".to_string(),
+                actual: component.lockfiles.join(", "),
+                evidence: component
+                    .lockfiles
+                    .iter()
+                    .map(|source| DriftEvidence {
+                        source: format!("{}/{}", component.path, source),
+                        kind: "resolved".to_string(),
+                    })
+                    .collect(),
+            });
+        }
+        if component.ecosystem == Ecosystem::JavaScript
+            && !detection
+                .root
+                .join(&component.path)
+                .join("node_modules")
+                .is_dir()
+        {
+            issues.push(DriftItem {
+                subject: component.path.clone(),
+                status: "drift".to_string(),
+                expected: "installed dependencies".to_string(),
+                actual: "node_modules/ absent".to_string(),
+                evidence: vec![
+                    DriftEvidence {
+                        source: "package.json".to_string(),
+                        kind: "declared".to_string(),
+                    },
+                    DriftEvidence {
+                        source: "node_modules/".to_string(),
+                        kind: "installed".to_string(),
+                    },
+                ],
+            });
+        }
+    }
+    if live {
+        for component in &detection.components {
+            if component.ecosystem == Ecosystem::Container {
+                issues.push(DriftItem {
+                    subject: component.path.clone(),
+                    status: "unknown".to_string(),
+                    expected: "declared runtime services".to_string(),
+                    actual: "runtime not established".to_string(),
+                    evidence: vec![DriftEvidence {
+                        source: "docker compose ps".to_string(),
+                        kind: "runtime".to_string(),
+                    }],
+                });
+            }
+        }
+    }
+    issues.sort_by(|a, b| a.subject.cmp(&b.subject).then(a.status.cmp(&b.status)));
+    DriftOutput {
+        schema_version: "1",
+        command: "drift",
+        live,
+        status: if issues.iter().any(|issue| issue.status == "drift") {
+            "drift".to_string()
+        } else if issues.is_empty() {
+            "match".to_string()
+        } else {
+            "ambiguous".to_string()
+        },
+        issues,
+    }
+}
+
+fn render_graph(output: &GraphOutput) -> String {
+    let mut lines = vec!["PROJECT GRAPH".to_string()];
+    lines.extend(
+        output
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "component")
+            .map(|node| {
+                format!(
+                    "{} ({})",
+                    node.id,
+                    serde_json::to_string(&node.ecosystem).unwrap()
+                )
+            }),
+    );
+    lines.join("\n")
+}
+
+fn render_reality(output: &RealityOutput) -> String {
+    let count = |layer: &RealityLayer| layer.observations.len();
+    format!(
+        "PROJECT\n  {} components\nDECLARED\n  {}\nRESOLVED\n  {}\nINSTALLED\n  {}\nRUNTIME\n  {}",
+        count(&output.declared),
+        count(&output.declared),
+        count(&output.resolved),
+        count(&output.installed),
+        if output.live {
+            "inspected"
+        } else {
+            "not inspected"
+        }
+    )
+}
+
+fn render_drift(output: &DriftOutput) -> String {
+    if output.issues.is_empty() {
+        return "NO DRIFT".to_string();
+    }
+    let mut lines = vec![format!("{} issues", output.issues.len())];
+    lines.extend(
+        output
+            .issues
+            .iter()
+            .map(|issue| format!("  {}\n    {}", issue.subject, issue.actual)),
+    );
+    lines.join("\n")
+}
+
 struct ParsedCli {
     command: CommandName,
     json: bool,
     run_args: Vec<String>,
     tool: Option<String>,
     dry_run: bool,
+    live: bool,
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli, CliError>
@@ -508,6 +1053,8 @@ where
     args.retain(|arg| arg != "--json");
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     args.retain(|arg| arg != "--dry-run");
+    let live = args.iter().any(|arg| arg == "--live");
+    args.retain(|arg| arg != "--live");
     let tool = if let Some(index) = args.iter().position(|arg| arg == "--tool") {
         if index + 1 >= args.len() {
             return Err(CliError {
@@ -551,6 +1098,9 @@ where
         [command] if command == "scripts" => (CommandName::Scripts, Vec::new()),
         [command] if command == "workspaces" => (CommandName::Workspaces, Vec::new()),
         [command] if command == "lock" => (CommandName::Lock, Vec::new()),
+        [command] if command == "graph" => (CommandName::Graph, Vec::new()),
+        [command] if command == "reality" => (CommandName::Reality, Vec::new()),
+        [command] if command == "drift" => (CommandName::Drift, Vec::new()),
         [command] if command == "run" => {
             return Err(CliError {
                 message: format!("pax run requires a target\n\n{}", usage()),
@@ -589,11 +1139,12 @@ where
         run_args,
         tool,
         dry_run,
+        live,
     })
 }
 
 fn usage() -> String {
-    "usage: pax [--json] [--dry-run] [--tool <tool>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock>"
+    "usage: pax [--json] [--live] [--dry-run] [--tool <tool>] <run <target> [args...]|x <tool> [args...]|install [package...]|add <package>|remove <package>|exec <command> [args...]|deploy [args...]|info|doctor|deps|scripts|workspaces|lock|graph|reality|drift>"
         .to_string()
 }
 
@@ -2208,6 +2759,9 @@ fn render_human(output: &CommandOutput) -> String {
         "scripts" => "PAX Scripts",
         "workspaces" => "PAX Workspaces",
         "lock" => "PAX Lock",
+        "graph" => "PAX Graph",
+        "reality" => "PAX Reality",
+        "drift" => "PAX Drift",
         _ => "PAX",
     };
     let manager = output

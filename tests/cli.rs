@@ -470,6 +470,105 @@ fn deploy_rejects_ambiguous_provider_evidence() {
     );
 }
 
+#[test]
+fn graph_json_preserves_ecosystem_dependency_semantics_and_evidence() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"web","dependencies":{"react":"^19"},"devDependencies":{"typescript":"^5"}}"#,
+    );
+    write(
+        &root.join("services/api/requirements.txt"),
+        "requests==2.32.0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "graph"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "graph");
+    assert_eq!(
+        value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "react")
+            .unwrap()["ecosystem"],
+        "javascript"
+    );
+    assert!(value["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["from"] == "." && edge["to"] == "react" && edge["kind"] == "runtime-dependency"
+    }));
+    assert!(
+        value["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["evidence"][0] == "package.json")
+    );
+}
+
+#[test]
+fn reality_json_is_static_and_reports_installed_state_conservatively() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"web","packageManager":"pnpm@10"}"#,
+    );
+    write(&root.join("pnpm-lock.yaml"), "lockfileVersion: '9'\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "reality"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["runtime"]["observations"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(value["installed"]["observations"][0]["status"], "absent");
+    assert_eq!(
+        value["resolved"]["observations"][0]["evidence"][0],
+        "pnpm-lock.yaml"
+    );
+}
+
+#[test]
+fn drift_json_reports_conflicts_and_nonzero_exit_without_mutating_files() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"web","packageManager":"pnpm@10","dependencies":{"react":"^19"}}"#,
+    );
+    write(&root.join("package-lock.json"), "{}");
+    let before = fs::read_to_string(root.join("package.json")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "drift"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "drift");
+    assert!(
+        value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["subject"] == ".")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("package.json")).unwrap(),
+        before
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn deploy_delegates_with_explicit_tool_and_preserves_exit_code() {
