@@ -9,6 +9,10 @@ It inspects npm, pnpm, Bun, and Yarn projects through one fast Rust CLI without 
 ```bash
 pax info
 pax doctor
+pax deps
+pax scripts
+pax workspaces
+pax lock
 pax --json info
 pax --json doctor
 ```
@@ -21,6 +25,11 @@ pax --json doctor
 - lockfile presence
 - package-manager and lockfile consistency
 - workspace configuration
+
+`pax deps`, `pax scripts`, `pax workspaces`, and `pax lock` expose normalized
+package metadata, script definitions, workspace configuration, and lockfile
+state. All commands support `--json`; PAX only reads repository files and
+never invokes a package manager.
 
 ## Detection model
 

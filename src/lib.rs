@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -15,6 +16,10 @@ pub struct CliError {
 enum CommandName {
     Info,
     Doctor,
+    Deps,
+    Scripts,
+    Workspaces,
+    Lock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -57,6 +62,12 @@ struct PackageJsonData {
     name: Option<String>,
     package_manager_field: Option<String>,
     has_workspaces: bool,
+    dependencies: BTreeMap<String, String>,
+    dev_dependencies: BTreeMap<String, String>,
+    optional_dependencies: BTreeMap<String, String>,
+    peer_dependencies: BTreeMap<String, String>,
+    scripts: BTreeMap<String, String>,
+    workspace_packages: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,6 +80,40 @@ struct CommandOutput {
     result: CommandResult,
     diagnostics: Vec<Diagnostic>,
     evidence: Evidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependencies: Option<DependencyGroups>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scripts: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspaces: Option<WorkspaceOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock: Option<LockOutput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencyGroups {
+    dependencies: BTreeMap<String, String>,
+    dev_dependencies: BTreeMap<String, String>,
+    optional_dependencies: BTreeMap<String, String>,
+    peer_dependencies: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceOutput {
+    enabled: bool,
+    source: Option<String>,
+    packages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LockOutput {
+    found: bool,
+    files: Vec<String>,
+    selected: Option<String>,
+    manager: Option<PackageManager>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +188,7 @@ struct RepositoryDetection {
     manager: Option<DetectedManager>,
     lockfiles: Vec<String>,
     workspace_files: Vec<String>,
+    workspace_packages: Vec<String>,
     selection_notes: Vec<String>,
 }
 
@@ -169,6 +215,10 @@ where
     let output = match cli.command {
         CommandName::Info => build_output("info", detection, false),
         CommandName::Doctor => build_output("doctor", detection, true),
+        CommandName::Deps => build_output("deps", detection, false),
+        CommandName::Scripts => build_output("scripts", detection, false),
+        CommandName::Workspaces => build_output("workspaces", detection, false),
+        CommandName::Lock => build_output("lock", detection, false),
     };
 
     if cli.json {
@@ -202,6 +252,10 @@ where
     let command = match args.as_slice() {
         [command] if command == "info" => CommandName::Info,
         [command] if command == "doctor" => CommandName::Doctor,
+        [command] if command == "deps" => CommandName::Deps,
+        [command] if command == "scripts" => CommandName::Scripts,
+        [command] if command == "workspaces" => CommandName::Workspaces,
+        [command] if command == "lock" => CommandName::Lock,
         [] => {
             return Err(CliError {
                 message: usage(),
@@ -220,7 +274,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: pax [--json] <info|doctor>".to_string()
+    "usage: pax [--json] <info|doctor|deps|scripts|workspaces|lock>".to_string()
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
@@ -264,6 +318,26 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
     };
 
     let workspace = workspace_source.is_some();
+    let workspace_packages = package_json_data
+        .as_ref()
+        .map(|data| data.workspace_packages.clone())
+        .filter(|packages| !packages.is_empty())
+        .unwrap_or_else(|| {
+            workspace_files
+                .iter()
+                .filter(|file| *file == "pnpm-workspace.yaml")
+                .flat_map(|_| {
+                    fs::read_to_string(root.join("pnpm-workspace.yaml"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| line.trim().strip_prefix("- "))
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        });
     let (manager, selection_notes) = select_manager(package_json_data.as_ref(), &lockfiles);
     let fallback_name = root
         .file_name()
@@ -285,6 +359,7 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
         manager,
         lockfiles,
         workspace_files,
+        workspace_packages,
         selection_notes,
     })
 }
@@ -309,11 +384,50 @@ fn read_package_json(path: &Path) -> Result<PackageJsonData, CliError> {
         .and_then(|value| value.as_str())
         .map(str::to_string);
     let has_workspaces = value.get("workspaces").is_some();
+    let workspace_packages = value
+        .get("workspaces")
+        .and_then(|workspaces| {
+            workspaces.as_array().or_else(|| {
+                workspaces
+                    .get("packages")
+                    .and_then(serde_json::Value::as_array)
+            })
+        })
+        .map(|packages| {
+            packages
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let read_map = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|(name, version)| {
+                        version
+                            .as_str()
+                            .map(|version| (name.clone(), version.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     Ok(PackageJsonData {
         name,
         package_manager_field,
         has_workspaces,
+        dependencies: read_map("dependencies"),
+        dev_dependencies: read_map("devDependencies"),
+        optional_dependencies: read_map("optionalDependencies"),
+        peer_dependencies: read_map("peerDependencies"),
+        scripts: read_map("scripts"),
+        workspace_packages,
     })
 }
 
@@ -472,12 +586,12 @@ fn build_output(
             name: detection.project_name,
             package_json: detection.package_json,
             workspace: detection.workspace,
-            workspace_source: detection.workspace_source,
+            workspace_source: detection.workspace_source.clone(),
         },
         manager: ManagerInfo {
             name: manager_name,
             version: manager_version,
-            lockfile: manager_lockfile,
+            lockfile: manager_lockfile.clone(),
             selected_by,
         },
         result: CommandResult { summary, runtime },
@@ -485,11 +599,52 @@ fn build_output(
         evidence: Evidence {
             package_manager_field: detection
                 .package_json_data
-                .and_then(|data| data.package_manager_field),
-            lockfiles: detection.lockfiles,
+                .as_ref()
+                .and_then(|data| data.package_manager_field.clone()),
+            lockfiles: detection.lockfiles.clone(),
             workspace_files: detection.workspace_files,
             selection_notes: detection.selection_notes,
         },
+        dependencies: (command == "deps").then(|| {
+            let data = detection
+                .package_json_data
+                .clone()
+                .unwrap_or(PackageJsonData {
+                    name: None,
+                    package_manager_field: None,
+                    has_workspaces: false,
+                    dependencies: BTreeMap::new(),
+                    dev_dependencies: BTreeMap::new(),
+                    optional_dependencies: BTreeMap::new(),
+                    peer_dependencies: BTreeMap::new(),
+                    scripts: BTreeMap::new(),
+                    workspace_packages: Vec::new(),
+                });
+            DependencyGroups {
+                dependencies: data.dependencies,
+                dev_dependencies: data.dev_dependencies,
+                optional_dependencies: data.optional_dependencies,
+                peer_dependencies: data.peer_dependencies,
+            }
+        }),
+        scripts: (command == "scripts").then(|| {
+            detection
+                .package_json_data
+                .clone()
+                .map(|data| data.scripts)
+                .unwrap_or_default()
+        }),
+        workspaces: (command == "workspaces").then(|| WorkspaceOutput {
+            enabled: detection.workspace,
+            source: detection.workspace_source.clone(),
+            packages: detection.workspace_packages.clone(),
+        }),
+        lock: (command == "lock").then(|| LockOutput {
+            found: !detection.lockfiles.is_empty(),
+            files: detection.lockfiles.clone(),
+            selected: manager_lockfile,
+            manager: manager_name,
+        }),
     }
 }
 
@@ -610,6 +765,10 @@ fn render_human(output: &CommandOutput) -> String {
     let heading = match output.command {
         "info" => "PAX Info",
         "doctor" => "PAX Doctor",
+        "deps" => "PAX Dependencies",
+        "scripts" => "PAX Scripts",
+        "workspaces" => "PAX Workspaces",
+        "lock" => "PAX Lock",
         _ => "PAX",
     };
     let manager = output
@@ -645,6 +804,24 @@ fn render_human(output: &CommandOutput) -> String {
     }
 
     lines.push(String::new());
+    if let Some(dependencies) = &output.dependencies {
+        lines.push(format!(
+            "Dependencies {}",
+            dependencies.dependencies.len()
+                + dependencies.dev_dependencies.len()
+                + dependencies.optional_dependencies.len()
+                + dependencies.peer_dependencies.len()
+        ));
+    }
+    if let Some(scripts) = &output.scripts {
+        lines.push(format!("Scripts      {}", scripts.len()));
+    }
+    if let Some(workspaces) = &output.workspaces {
+        lines.push(format!("Packages     {}", workspaces.packages.len()));
+    }
+    if let Some(lock) = &output.lock {
+        lines.push(format!("Lockfiles    {}", lock.files.join(", ")));
+    }
     lines.extend(output.diagnostics.iter().map(|diagnostic| {
         format!(
             "{} {} {}",
