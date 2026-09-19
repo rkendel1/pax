@@ -90,3 +90,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
