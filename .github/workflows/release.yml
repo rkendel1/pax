@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, v0.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -34,7 +40,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
@@ -58,7 +64,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           version="${VERSION#v}"
           if [[ "$TARGET" == *windows* ]]; then
@@ -84,3 +90,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
