@@ -3,20 +3,24 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 fn temp_dir() -> PathBuf {
     let unique = format!(
-        "pax-cli-tests-{}-{}",
+        "pax-cli-tests-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
     );
     let dir = std::env::temp_dir().join(unique);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    fs::canonicalize(dir).unwrap()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -208,6 +212,130 @@ fn run_delegates_to_detected_manager_and_preserves_exit_code() {
 
 #[cfg(unix)]
 #[test]
+fn first_class_operations_delegate_through_the_selected_native_tool() {
+    let root = temp_dir();
+    let bin = root.join("bin");
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"pnpm@10.0.0","scripts":{"build":"build","test":"test","lint":"lint","typecheck":"typecheck"}}"#,
+    );
+    let pnpm = bin.join("pnpm");
+    write(
+        &pnpm,
+        "#!/bin/sh\nprintf '%s|%s|%s' \"$PWD\" \"$1\" \"$2\"\nexit 0\n",
+    );
+    fs::set_permissions(&pnpm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), path.to_string_lossy());
+
+    for operation in ["build", "test", "lint", "typecheck"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .arg(operation)
+            .current_dir(&root)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{operation} failed");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}|run|{operation}", root.display())
+        );
+    }
+}
+
+#[test]
+fn first_class_dry_run_is_authoritative_and_structurally_identical_in_json() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"npm@10.0.0","scripts":{"build":"touch must-not-exist"}}"#,
+    );
+    let human = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--dry-run", "build"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(!root.join("must-not-exist").exists());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Operation:   build"));
+    assert!(human.contains("Command:     npm run build"));
+
+    let json = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dry-run", "build"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["operation"], "build");
+    assert_eq!(value["tool"], "npm");
+    assert_eq!(value["command"], serde_json::json!(["npm", "run", "build"]));
+    assert_eq!(value["project_root"], root.to_str().unwrap());
+    assert_eq!(value["supported"], true);
+    assert!(!root.join("must-not-exist").exists());
+
+    let custom = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dry-run", "run", "build"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(custom.status.success());
+    let custom: serde_json::Value = serde_json::from_slice(&custom.stdout).unwrap();
+    assert_eq!(custom["operation"], "custom:build");
+    assert_eq!(custom["command"], value["command"]);
+}
+
+#[test]
+fn unsupported_first_class_operation_guides_custom_operations() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"name":"sample","packageManager":"npm@10.0.0","scripts":{"compile":"tsc"}}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("build")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pax run <operation>"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("compile")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pax run compile"));
+}
+
+#[test]
+fn rust_first_class_operations_use_cargo_canonical_commands() {
+    let root = temp_dir();
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n",
+    );
+    for (operation, native) in [
+        ("build", "build"),
+        ("test", "test"),
+        ("lint", "clippy"),
+        ("typecheck", "check"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(["--json", "--dry-run", operation])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{operation} failed");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["command"], serde_json::json!(["cargo", native]));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn x_delegates_to_native_package_runner() {
     let root = temp_dir();
     let bin = root.join("bin");
@@ -371,6 +499,10 @@ fn dry_run_produces_machine_readable_execution_plan() {
 #[test]
 fn command_help_describes_supported_execution_and_observation_commands() {
     for (command, expected) in [
+        ("build", "Build the project"),
+        ("test", "Test the project"),
+        ("lint", "Lint the project"),
+        ("typecheck", "Typecheck the project"),
         ("run", "Run a project task"),
         ("x", "ephemeral package"),
         ("install", "Install declared"),
@@ -420,7 +552,7 @@ fn exec_forwards_exact_command_without_detection() {
 
 #[cfg(unix)]
 #[test]
-fn install_orchestrates_declared_mixed_project_components() {
+fn install_delegates_once_to_the_authoritative_root_manager() {
     let root = temp_dir();
     let bin = root.join("bin");
     write(
@@ -457,10 +589,19 @@ fn install_orchestrates_declared_mixed_project_components() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("PAX install: 3 components"));
-    assert!(stdout.contains(":install"));
-    assert!(stdout.contains(":sync"));
-    assert!(stdout.contains(":fetch"));
+    assert_eq!(stdout, format!("{}:install\n", root.display()));
+    assert!(!stdout.contains(":sync"));
+    assert!(!stdout.contains(":fetch"));
+
+    let dry_run = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "--dry-run", "install"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(dry_run.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(plan["operation"], "install");
+    assert_eq!(plan["command"], serde_json::json!(["npm", "install"]));
 }
 
 #[test]

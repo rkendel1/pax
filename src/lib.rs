@@ -70,6 +70,10 @@ pub struct CliError {
 
 #[derive(Clone, Copy, Debug)]
 enum CommandName {
+    Build,
+    Test,
+    Lint,
+    Typecheck,
     Run,
     X,
     Install,
@@ -86,6 +90,35 @@ enum CommandName {
     Graph,
     Reality,
     Drift,
+}
+
+#[derive(Clone, Debug)]
+enum Operation {
+    Build,
+    Test,
+    Lint,
+    Typecheck,
+    Install,
+    Add,
+    Remove,
+    Deploy,
+    Custom(String),
+}
+
+impl Operation {
+    fn name(&self) -> String {
+        match self {
+            Self::Build => "build".to_string(),
+            Self::Test => "test".to_string(),
+            Self::Lint => "lint".to_string(),
+            Self::Typecheck => "typecheck".to_string(),
+            Self::Install => "install".to_string(),
+            Self::Add => "add".to_string(),
+            Self::Remove => "remove".to_string(),
+            Self::Deploy => "deploy".to_string(),
+            Self::Custom(name) => format!("custom:{name}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -367,6 +400,15 @@ struct RunCommand {
     working_directory: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedOperation {
+    operation: Operation,
+    command: RunCommand,
+    selection_reason: String,
+    ecosystem: Option<String>,
+    evidence: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ExecutionPlan {
     operation: String,
@@ -376,6 +418,11 @@ struct ExecutionPlan {
     command: Vec<String>,
     evidence: Vec<String>,
     working_directory: String,
+    project_root: String,
+    workspace: Option<String>,
+    environment: BTreeMap<String, String>,
+    supported: bool,
+    selection_reason: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,7 +517,11 @@ where
     if cli.tool.is_none()
         && matches!(
             cli.command,
-            CommandName::Run
+            CommandName::Build
+                | CommandName::Test
+                | CommandName::Lint
+                | CommandName::Typecheck
+                | CommandName::Run
                 | CommandName::X
                 | CommandName::Install
                 | CommandName::Add
@@ -492,7 +543,11 @@ where
         || cli.tool.is_none()
             && matches!(
                 cli.command,
-                CommandName::Run
+                CommandName::Build
+                    | CommandName::Test
+                    | CommandName::Lint
+                    | CommandName::Typecheck
+                    | CommandName::Run
                     | CommandName::X
                     | CommandName::Install
                     | CommandName::Add
@@ -516,90 +571,37 @@ where
             exit_code: 2,
         });
     }
-    if let CommandName::Run = cli.command {
-        let command = build_run_command(&detection, &cli.run_args, cli.tool.as_deref())?;
-        return dispatch_execution(command, cli.dry_run, cli.json);
+    let operation = match cli.command {
+        CommandName::Build => Some(Operation::Build),
+        CommandName::Test => Some(Operation::Test),
+        CommandName::Lint => Some(Operation::Lint),
+        CommandName::Typecheck => Some(Operation::Typecheck),
+        CommandName::Run => Some(Operation::Custom(cli.run_args[0].clone())),
+        CommandName::Install => Some(Operation::Install),
+        CommandName::Add => Some(Operation::Add),
+        CommandName::Remove => Some(Operation::Remove),
+        CommandName::Deploy => Some(Operation::Deploy),
+        _ => None,
+    };
+    if let Some(operation) = operation {
+        let operation_args = if matches!(cli.command, CommandName::Run) {
+            &cli.run_args[1..]
+        } else {
+            &cli.run_args[..]
+        };
+        let resolved =
+            resolve_operation(&detection, operation, operation_args, cli.tool.as_deref())?;
+        return dispatch_resolved_operation(resolved, &detection, cli.dry_run, cli.json);
     }
     if let CommandName::X = cli.command {
         let command = build_x_command(&detection, &cli.run_args, cli.tool.as_deref())?;
         return dispatch_execution(command, cli.dry_run, cli.json);
     }
-    if let CommandName::Install = cli.command {
-        if cli.run_args.is_empty() {
-            let commands = build_project_install_commands(&detection, cli.tool.as_deref())?;
-            return dispatch_project_install(commands, cli.dry_run, cli.json);
-        }
-        let command = build_install_command(&detection, &cli.run_args, cli.tool.as_deref())?;
-        return dispatch_execution(command, cli.dry_run, cli.json);
-    }
-    if matches!(cli.command, CommandName::Add | CommandName::Remove) {
-        let command = build_package_mutation_command(
-            &detection,
-            &cli.run_args,
-            cli.tool.as_deref(),
-            matches!(cli.command, CommandName::Add),
-        )?;
-        return dispatch_execution(command, cli.dry_run, cli.json);
-    }
-    if let CommandName::Deploy = cli.command {
-        let selection = select_deploy_provider(&detection, cli.tool.as_deref())?;
-        let (program, canonical) = selection.provider.command();
-        let mut command_args = vec![canonical.to_string()];
-        command_args.extend(cli.run_args.iter().cloned());
-        if cli.dry_run {
-            let plan = ExecutionPlan {
-                operation: "deploy".to_string(),
-                ecosystem: "deployment".to_string(),
-                tool: selection.provider.name().to_string(),
-                runner: program.to_string(),
-                command: std::iter::once(program.to_string())
-                    .chain(command_args.iter().cloned())
-                    .collect(),
-                evidence: selection.evidence.clone(),
-                working_directory: detection.root.display().to_string(),
-            };
-            if cli.json {
-                return serde_json::to_string_pretty(&plan).map_err(|error| CliError {
-                    message: format!("failed to serialize execution plan: {error}"),
-                    exit_code: 1,
-                });
-            }
-            return Ok(format!(
-                "ecosystem: deployment\nprovider: {}\nevidence: {}\ncommand: {} {}\nworking directory: {}",
-                selection.provider.name(),
-                selection.evidence.join(", "),
-                program,
-                command_args.join(" "),
-                detection.root.display()
-            ));
-        }
-        let command = RunCommand {
-            program: program.to_string(),
-            args: command_args,
-            working_directory: detection.root.clone(),
-        };
-        let status = Command::new(&command.program)
-            .args(&command.args)
-            .current_dir(&command.working_directory)
-            .status()
-            .map_err(|error| CliError {
-                message: format!("failed to execute {}: {error}", command.program),
-                exit_code: 1,
-            })?;
-        return match status.code() {
-            Some(0) => Ok(String::new()),
-            Some(code) => Err(CliError {
-                message: String::new(),
-                exit_code: code.min(u8::MAX as i32) as u8,
-            }),
-            None => Err(CliError {
-                message: String::new(),
-                exit_code: 1,
-            }),
-        };
-    }
-
     let output = match cli.command {
+        CommandName::Build => unreachable!(),
+        CommandName::Test => unreachable!(),
+        CommandName::Lint => unreachable!(),
+        CommandName::Typecheck => unreachable!(),
         CommandName::Run => unreachable!(),
         CommandName::X => unreachable!(),
         CommandName::Install => unreachable!(),
@@ -1118,7 +1120,16 @@ where
         && args[1] == "--help"
         && matches!(
             args[0].as_str(),
-            "run" | "x" | "install" | "graph" | "reality" | "drift"
+            "build"
+                | "test"
+                | "lint"
+                | "typecheck"
+                | "run"
+                | "x"
+                | "install"
+                | "graph"
+                | "reality"
+                | "drift"
         )
     {
         return Err(CliError {
@@ -1172,6 +1183,18 @@ where
     args = filtered;
 
     let (command, run_args) = match args.as_slice() {
+        [command, rest @ ..]
+            if matches!(command.as_str(), "build" | "test" | "lint" | "typecheck") =>
+        {
+            let command = match command.as_str() {
+                "build" => CommandName::Build,
+                "test" => CommandName::Test,
+                "lint" => CommandName::Lint,
+                "typecheck" => CommandName::Typecheck,
+                _ => unreachable!(),
+            };
+            (command, rest.to_vec())
+        }
         [command, target, rest @ ..] if command == "run" || command == "x" => {
             if target.is_empty() {
                 return Err(CliError {
@@ -1229,8 +1252,15 @@ where
             });
         }
         _ => {
+            let guidance = args.first().map_or(String::new(), |operation| {
+                format!("\nTo run a project-defined operation, use: pax run {operation}")
+            });
             return Err(CliError {
-                message: format!("unknown arguments: {}\n\n{}", args.join(" "), usage()),
+                message: format!(
+                    "unknown arguments: {}{guidance}\n\n{}",
+                    args.join(" "),
+                    usage()
+                ),
                 exit_code: 2,
             });
         }
@@ -1255,6 +1285,8 @@ Usage: pax [OPTIONS] COMMAND [ARGS...]
 Inspection:
   info, doctor, deps, scripts, workspaces, lock
   graph, reality, drift
+Project operations (delegated to native tools):
+  build, test, lint, typecheck
 Execution (delegated to native tools):
   run, x, install, add, remove, exec, deploy
 
@@ -1267,13 +1299,17 @@ Options:
   -h, --help         show this help
   -V, --version      show the package version
 
-The v0.1 command surface is intentionally narrow. See README.md for
-selection rules, installation, platform notes, and the JSON contract."#
+All operations resolve to the project's native tooling. Use `pax run <operation>`
+for project-defined operations. See README.md for the JSON contract."#
         .to_string()
 }
 
 fn command_usage(command: &str) -> String {
     match command {
+        "build" => "Usage: pax build [args...]\nBuild the project with its selected native tool.".to_string(),
+        "test" => "Usage: pax test [args...]\nTest the project with its selected native tool.".to_string(),
+        "lint" => "Usage: pax lint [args...]\nLint the project with its selected native tool.".to_string(),
+        "typecheck" => "Usage: pax typecheck [args...]\nTypecheck the project with its selected native tool.".to_string(),
         "run" => "Usage: pax run <target> [args...]\nRun a project task with the selected native tool.".to_string(),
         "x" => "Usage: pax x <package> [args...]\nRun an ephemeral package or tool with the native runner.".to_string(),
         "install" => "Usage: pax install [package...]\nInstall declared project dependencies or named packages.".to_string(),
@@ -1563,6 +1599,267 @@ fn build_package_mutation_command(
     })
 }
 
+fn resolve_operation(
+    detection: &RepositoryDetection,
+    operation: Operation,
+    args: &[String],
+    override_tool: Option<&str>,
+) -> Result<ResolvedOperation, CliError> {
+    let mut ecosystem = None;
+    let mut evidence = Vec::new();
+    let mut operation_selection_reason = None;
+    let command = match &operation {
+        Operation::Build | Operation::Test | Operation::Lint | Operation::Typecheck => {
+            resolve_standard_project_command(detection, &operation.name(), args, override_tool)?
+        }
+        Operation::Custom(name) => {
+            let run_args = std::iter::once(name.clone())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            build_run_command(detection, &run_args, override_tool)?
+        }
+        Operation::Install => {
+            if args.is_empty() {
+                resolve_root_install_command(detection, override_tool)?
+            } else {
+                build_install_command(detection, args, override_tool)?
+            }
+        }
+        Operation::Add | Operation::Remove => build_package_mutation_command(
+            detection,
+            args,
+            override_tool,
+            matches!(operation, Operation::Add),
+        )?,
+        Operation::Deploy => {
+            let selection = select_deploy_provider(detection, override_tool)?;
+            let (program, canonical) = selection.provider.command();
+            ecosystem = Some("deployment".to_string());
+            evidence = selection.evidence;
+            operation_selection_reason = Some(if override_tool.is_some() {
+                format!(
+                    "selected {} by explicit --tool override",
+                    selection.provider.name()
+                )
+            } else {
+                format!(
+                    "selected {} from deployment evidence",
+                    selection.provider.name()
+                )
+            });
+            RunCommand {
+                program: program.to_string(),
+                args: std::iter::once(canonical.to_string())
+                    .chain(args.iter().cloned())
+                    .collect(),
+                working_directory: detection.root.clone(),
+            }
+        }
+    };
+    let selection_reason = operation_selection_reason.unwrap_or_else(|| {
+        if let Some(tool) = override_tool {
+            format!("selected {tool} by explicit --tool override")
+        } else if let Some(manager) = detection.manager.as_ref() {
+            format!("selected {} by {}", manager.name, manager.selected_by)
+        } else {
+            let tool = detection
+                .components
+                .iter()
+                .find(|component| component.path == ".")
+                .and_then(|component| component.tool.as_deref())
+                .unwrap_or(&command.program);
+            format!("selected {tool} from root project evidence")
+        }
+    });
+    Ok(ResolvedOperation {
+        operation,
+        command,
+        selection_reason,
+        ecosystem,
+        evidence,
+    })
+}
+
+fn resolve_standard_project_command(
+    detection: &RepositoryDetection,
+    operation: &str,
+    extra_args: &[String],
+    override_tool: Option<&str>,
+) -> Result<RunCommand, CliError> {
+    let selected_tool = override_tool.or_else(|| {
+        detection
+            .manager
+            .as_ref()
+            .map(|manager| manager.name.display_name())
+    });
+    if selected_tool.is_some_and(|tool| PackageManager::parse(tool).is_some()) {
+        if !detection
+            .package_json_data
+            .as_ref()
+            .is_some_and(|data| data.scripts.contains_key(operation))
+        {
+            return Err(CliError {
+                message: format!(
+                    "project operation '{operation}' is not supported: package.json has no '{operation}' script\nUse `pax run <operation>` for another project-defined operation."
+                ),
+                exit_code: 2,
+            });
+        }
+        let run_args = std::iter::once(operation.to_string())
+            .chain(extra_args.iter().cloned())
+            .collect::<Vec<_>>();
+        return build_run_command(detection, &run_args, override_tool);
+    }
+
+    let root_component = detection
+        .components
+        .iter()
+        .find(|component| component.path == ".");
+    let tool = override_tool
+        .or_else(|| root_component.and_then(|component| component.tool.as_deref()))
+        .ok_or_else(|| CliError {
+            message: format!("project operation '{operation}' is not supported: no authoritative native tool was detected"),
+            exit_code: 1,
+        })?;
+    if tool == "cargo" {
+        let native_operation = match operation {
+            "build" => "build",
+            "test" => "test",
+            "lint" => "clippy",
+            "typecheck" => "check",
+            _ => unreachable!(),
+        };
+        return Ok(RunCommand {
+            program: "cargo".to_string(),
+            args: std::iter::once(native_operation.to_string())
+                .chain(extra_args.iter().cloned())
+                .collect(),
+            working_directory: detection.root.clone(),
+        });
+    }
+    if tool == "docker" && operation == "build" {
+        return Ok(RunCommand {
+            program: "docker".to_string(),
+            args: std::iter::once("compose".to_string())
+                .chain(std::iter::once("build".to_string()))
+                .chain(extra_args.iter().cloned())
+                .collect(),
+            working_directory: detection.root.clone(),
+        });
+    }
+    let run_args = std::iter::once(operation.to_string())
+        .chain(extra_args.iter().cloned())
+        .collect::<Vec<_>>();
+    build_run_command(detection, &run_args, override_tool)
+}
+
+fn resolve_root_install_command(
+    detection: &RepositoryDetection,
+    override_tool: Option<&str>,
+) -> Result<RunCommand, CliError> {
+    if detection.package_json
+        || override_tool.is_some_and(|tool| PackageManager::parse(tool).is_some())
+    {
+        return build_install_command(detection, &[], override_tool);
+    }
+    let component = detection
+        .components
+        .iter()
+        .find(|component| component.path == ".")
+        .ok_or_else(|| CliError {
+            message: "no installable root project detected".to_string(),
+            exit_code: 1,
+        })?;
+    let tool = override_tool
+        .or(component.tool.as_deref())
+        .ok_or_else(|| CliError {
+            message: "could not detect an authoritative package manager".to_string(),
+            exit_code: 1,
+        })?;
+    let (program, args) = match tool {
+        "uv" => ("uv", vec!["sync".to_string()]),
+        "poetry" | "pdm" => (tool, vec!["install".to_string()]),
+        "pip" => {
+            let requirements = component
+                .manifests
+                .iter()
+                .find(|path| path.ends_with(".txt"));
+            match requirements {
+                Some(path) => (
+                    "pip",
+                    vec!["install".to_string(), "-r".to_string(), path.clone()],
+                ),
+                None => ("pip", vec!["install".to_string(), ".".to_string()]),
+            }
+        }
+        "cargo" => ("cargo", vec!["fetch".to_string()]),
+        _ => {
+            return Err(CliError {
+                message: format!("unsupported install operation for {tool}"),
+                exit_code: 2,
+            });
+        }
+    };
+    Ok(RunCommand {
+        program: program.to_string(),
+        args,
+        working_directory: detection.root.clone(),
+    })
+}
+
+fn dispatch_resolved_operation(
+    resolved: ResolvedOperation,
+    detection: &RepositoryDetection,
+    dry_run: bool,
+    json: bool,
+) -> Result<String, CliError> {
+    if dry_run {
+        let is_deploy = matches!(resolved.operation, Operation::Deploy);
+        let mut plan = execution_plan(&resolved.command);
+        plan.operation = resolved.operation.name();
+        plan.project_root = detection.root.display().to_string();
+        plan.workspace = detection.workspace_source.clone();
+        plan.selection_reason = resolved.selection_reason;
+        if let Some(ecosystem) = resolved.ecosystem {
+            plan.ecosystem = ecosystem;
+        }
+        if !resolved.evidence.is_empty() {
+            plan.evidence = resolved.evidence;
+        }
+        return if json {
+            serde_json::to_string_pretty(&plan).map_err(|error| CliError {
+                message: format!("failed to serialize execution plan: {error}"),
+                exit_code: 1,
+            })
+        } else {
+            if is_deploy {
+                Ok(format!(
+                    "ecosystem: {}\nprovider: {}\nevidence: {}\ncommand: {}\nworking directory: {}",
+                    plan.ecosystem,
+                    plan.tool,
+                    if plan.evidence.is_empty() {
+                        "none".to_string()
+                    } else {
+                        plan.evidence.join(", ")
+                    },
+                    plan.command.join(" "),
+                    plan.working_directory
+                ))
+            } else {
+                Ok(format!(
+                    "Operation:   {}\nTool:        {}\nSelected by: {}\nCommand:     {}\nWorking dir: {}",
+                    plan.operation,
+                    plan.tool,
+                    plan.selection_reason,
+                    plan.command.join(" "),
+                    plan.working_directory
+                ))
+            }
+        };
+    }
+    dispatch_execution(resolved.command, false, json)
+}
+
 fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<String, CliError> {
     if dry_run {
         let plan = execution_plan(&command);
@@ -1695,146 +1992,12 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
             .collect(),
         evidence,
         working_directory: command.working_directory.display().to_string(),
+        project_root: command.working_directory.display().to_string(),
+        workspace: None,
+        environment: BTreeMap::new(),
+        supported: true,
+        selection_reason: format!("selected {tool} from project evidence"),
     }
-}
-
-fn build_project_install_commands(
-    detection: &RepositoryDetection,
-    override_tool: Option<&str>,
-) -> Result<Vec<RunCommand>, CliError> {
-    let mut commands = Vec::new();
-    if detection.package_json {
-        let tool = override_tool
-            .or_else(|| {
-                detection
-                    .manager
-                    .as_ref()
-                    .map(|manager| manager.name.display_name())
-            })
-            .ok_or_else(|| CliError {
-                message: "could not determine the JavaScript package manager; use --tool"
-                    .to_string(),
-                exit_code: 1,
-            })?;
-        if !matches!(tool, "npm" | "pnpm" | "yarn" | "bun") {
-            return Err(CliError {
-                message: format!("unsupported JavaScript package manager: {tool}"),
-                exit_code: 2,
-            });
-        }
-        commands.push(RunCommand {
-            program: tool.to_string(),
-            args: vec!["install".to_string()],
-            working_directory: detection.root.clone(),
-        });
-    }
-    for component in &detection.components {
-        let Some(tool) = component.tool.as_deref() else {
-            continue;
-        };
-        let working_directory = detection.root.join(&component.path);
-        let command = match component.ecosystem {
-            Ecosystem::Python => match tool {
-                "uv" => ("uv", vec!["sync".to_string()]),
-                "poetry" => ("poetry", vec!["install".to_string()]),
-                "pdm" => ("pdm", vec!["install".to_string()]),
-                "pip" => {
-                    if let Some(requirements) = component
-                        .manifests
-                        .iter()
-                        .find(|path| path.ends_with(".txt"))
-                    {
-                        (
-                            "pip",
-                            vec![
-                                "install".to_string(),
-                                "-r".to_string(),
-                                requirements.clone(),
-                            ],
-                        )
-                    } else {
-                        ("pip", vec!["install".to_string(), ".".to_string()])
-                    }
-                }
-                _ => continue,
-            },
-            Ecosystem::Rust => ("cargo", vec!["fetch".to_string()]),
-            Ecosystem::JavaScript | Ecosystem::Container => continue,
-        };
-        commands.push(RunCommand {
-            program: command.0.to_string(),
-            args: command.1,
-            working_directory,
-        });
-    }
-    if commands.is_empty() {
-        return Err(CliError {
-            message: "no declared installable project components detected".to_string(),
-            exit_code: 1,
-        });
-    }
-    Ok(commands)
-}
-
-fn dispatch_project_install(
-    commands: Vec<RunCommand>,
-    dry_run: bool,
-    json: bool,
-) -> Result<String, CliError> {
-    if dry_run {
-        let plans = commands.iter().map(execution_plan).collect::<Vec<_>>();
-        return if json {
-            serde_json::to_string_pretty(&plans).map_err(|error| CliError {
-                message: format!("failed to serialize execution plans: {error}"),
-                exit_code: 1,
-            })
-        } else {
-            Ok(plans
-                .iter()
-                .map(|plan| {
-                    format!(
-                        "Ecosystem: {}\nTool: {}\nEvidence: {}\nCommand: {}\nWorking dir: {}",
-                        plan.ecosystem,
-                        plan.tool,
-                        if plan.evidence.is_empty() {
-                            "none".to_string()
-                        } else {
-                            plan.evidence.join(", ")
-                        },
-                        plan.command.join(" "),
-                        plan.working_directory
-                    )
-                })
-                .chain(std::iter::once(format!("{} components", plans.len())))
-                .collect::<Vec<_>>()
-                .join("\n"))
-        };
-    }
-    println!("PAX install: {} components", commands.len());
-    let mut first_failure = None;
-    for command in commands {
-        println!("→ {}", command.args.join(" "));
-        match Command::new(&command.program)
-            .args(&command.args)
-            .current_dir(&command.working_directory)
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                first_failure.get_or_insert(status.code().unwrap_or(1));
-            }
-            Err(error) => {
-                eprintln!("failed to execute {}: {error}", command.program);
-                first_failure.get_or_insert(1);
-            }
-        }
-    }
-    first_failure.map_or(Ok(String::new()), |code| {
-        Err(CliError {
-            message: String::new(),
-            exit_code: code.min(u8::MAX as i32) as u8,
-        })
-    })
 }
 
 fn build_run_command(
@@ -3049,20 +3212,24 @@ fn render_human(output: &CommandOutput) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let unique = format!(
-            "pax-tests-{}-{}",
+            "pax-tests-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
         );
         let dir = env::temp_dir().join(unique);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        fs::canonicalize(dir).unwrap()
     }
 
     fn write(path: &Path, contents: &str) {

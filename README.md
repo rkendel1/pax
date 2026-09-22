@@ -6,9 +6,9 @@ It inspects JavaScript, Python, Rust, and Docker projects through one fast Rust
 CLI without trying to replace the underlying native tool.
 
 “Read-only” describes PAX's observation model. Delegated commands such as
-`pax run`, `pax install`, `pax add`, `pax remove`, and `pax deploy` execute the
-selected native tool and may mutate project state exactly as that tool normally
-would.
+`pax build`, `pax test`, `pax lint`, `pax typecheck`, `pax run`, `pax install`,
+`pax add`, `pax remove`, and `pax deploy` execute the selected native tool and
+may mutate project state exactly as that tool normally would.
 
 ## Commands
 
@@ -24,6 +24,10 @@ pax reality
 pax drift
 pax reality --live
 pax drift --live
+pax build
+pax test
+pax lint
+pax typecheck
 pax run dev
 pax x prettier
 pax install
@@ -78,6 +82,13 @@ uses `uv`, Poetry, PDM, or Python, Rust uses Cargo, and Compose uses Docker
 Compose. Standard input/output/error, environment, working directory, and the
 delegated process exit status are preserved.
 
+`pax build`, `pax test`, `pax lint`, and `pax typecheck` are first-class project
+operations. PAX resolves each operation once, reports why it selected the
+native tool, and delegates execution. In JavaScript projects these commands use
+the corresponding package script; in Rust projects they map to Cargo's native
+`build`, `test`, `clippy`, and `check` operations. Use `pax run <operation>` for
+arbitrary project-defined operations.
+
 `pax x <package> [args...]` delegates package execution to the ecosystem's
 native runner, such as `npx`, `pnpm dlx`, `bunx`, `yarn dlx`, `uvx`, or `pipx`.
 `pax x install [args...]` delegates dependency installation to the detected
@@ -85,18 +96,18 @@ native package manager, including commands such as `pip install -r
 requirements.txt`.
 
 `pax install [package...]` is the universal installation entry point. It
-delegates both project installs and package additions to the authoritative
-ecosystem tool without reimplementing package-manager behavior.
+delegates once to the authoritative tool for the selected project root. The
+native package manager owns dependency resolution and fetching; PAX does not
+walk the dependency graph or issue one fetch per component.
 
-The command vocabulary is intentionally narrow:
+The command vocabulary is grouped by intent:
 
+- `pax build` / `test` / `lint` / `typecheck` — universal project operations
 - `pax run` — project task runner
 - `pax x` — ephemeral package/tool runner
 - `pax install` — dependency installation
 - `pax add` / `pax remove` — dependency mutations
 - `pax exec` — exact native command escape hatch
-
-This is the complete v0.1 API surface; no additional commands are implied.
 
 PAX resolves the ecosystem tool and delegates to it; it does not replace npm,
 pnpm, Yarn, Bun, uv, pip, Poetry, PDM, Cargo, or Docker. Use `--tool` for an
@@ -120,7 +131,8 @@ shell, container runtime, or deployment provider.
 | --- | --- | --- | --- | --- |
 | `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | no | project files |
 | `graph`, `reality`, `drift` | native observation | no | only `--live` | manifests, locks, installed/runtime observations |
-| `run`, `x`, `install`, `add`, `remove` | delegated/composite | install or mutation commands may | yes | detected or overridden tool |
+| `build`, `test`, `lint`, `typecheck` | resolved project operation | depends on native tool | yes | detected or overridden tool |
+| `run`, `x`, `install`, `add`, `remove` | native delegation | install or mutation commands may | yes | detected or overridden tool |
 | `exec` | exact delegation | depends on supplied command | yes | user-supplied command |
 
 Tool selection is deterministic and fail-closed: an explicit `--tool` override
@@ -129,6 +141,12 @@ evidence. Contradictory lockfiles without an override are reported as
 `ambiguous`; PAX never silently resolves the conflict. Use `--dir` to select a
 specific project root. Use `--` when arguments to a delegated command must not
 be interpreted as PAX flags.
+
+`--dry-run` is the authoritative execution contract: it uses the same resolved
+operation as execution without starting the native process. Add `--json` for
+the structural representation, including the operation, project root,
+workspace, selected tool, native command, environment additions, working
+directory, support status, evidence, and selection reason.
 
 JSON output is a versioned machine-readable contract. Observation statuses are
 `match`, `drift`, `ambiguous`, or `unknown`; unknown evidence is never promoted
