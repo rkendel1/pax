@@ -30,6 +30,26 @@ fn write(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
 }
 
+fn write_cargo_package(root: &Path, path: &str, name: &str) {
+    write(
+        &root.join(path).join("Cargo.toml"),
+        &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+    );
+    write(&root.join(path).join("src/lib.rs"), "pub fn value() {}\n");
+}
+
+fn write_cargo_workspace(root: &Path, lockfile: bool) {
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"3\"\n",
+    );
+    if lockfile {
+        write(&root.join("Cargo.lock"), "version = 4\n");
+    }
+    write_cargo_package(root, "crates/a", "a");
+    write_cargo_package(root, "crates/b", "b");
+}
+
 #[test]
 fn info_json_reports_detected_manager() {
     let root = temp_dir();
@@ -332,6 +352,136 @@ fn rust_first_class_operations_use_cargo_canonical_commands() {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["command"], serde_json::json!(["cargo", native]));
     }
+}
+
+#[test]
+fn cargo_workspace_observation_is_consistent_across_commands_and_formats() {
+    let root = temp_dir();
+    write_cargo_workspace(&root, true);
+    let commands = [
+        "info",
+        "doctor",
+        "deps",
+        "workspaces",
+        "graph",
+        "reality",
+        "drift",
+    ];
+
+    for command in commands {
+        let json = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(["--json", command])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            json.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        assert!(json.stderr.is_empty(), "{command} contaminated stderr");
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["cargo"]["workspace"], true, "{command}");
+        assert_eq!(value["cargo"]["lockfile"], "Cargo.lock", "{command}");
+        assert_eq!(
+            value["cargo"]["workspaceMembers"],
+            serde_json::json!(["a", "b"]),
+            "{command}"
+        );
+
+        let human = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .arg(command)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(human.status.success(), "{command}");
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(
+            !human.contains("Lockfile      missing"),
+            "{command}: {human}"
+        );
+    }
+}
+
+#[test]
+fn cargo_workspace_without_lockfile_remains_a_workspace_and_is_read_only() {
+    let root = temp_dir();
+    write_cargo_workspace(&root, false);
+    let manifest_before = fs::read(root.join("Cargo.toml")).unwrap();
+
+    for command in [
+        "info",
+        "doctor",
+        "deps",
+        "workspaces",
+        "graph",
+        "reality",
+        "drift",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(["--json", command])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["cargo"]["workspace"], true, "{command}");
+        assert_eq!(
+            value["cargo"]["lockfile"],
+            serde_json::Value::Null,
+            "{command}"
+        );
+        assert_eq!(
+            value["cargo"]["workspaceMembers"],
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    assert!(!root.join("Cargo.lock").exists());
+    assert_eq!(fs::read(root.join("Cargo.toml")).unwrap(), manifest_before);
+}
+
+#[test]
+fn single_package_cargo_project_has_independent_manifest_and_lock_observations() {
+    let root = temp_dir();
+    write_cargo_package(&root, ".", "single");
+    write(&root.join("Cargo.lock"), "version = 4\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "info"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["project"]["name"], "single");
+    assert_eq!(value["manager"]["name"], "cargo");
+    assert_eq!(value["cargo"]["workspace"], false);
+    assert_eq!(value["cargo"]["lockfile"], "Cargo.lock");
+    assert_eq!(
+        value["cargo"]["workspaceMembers"],
+        serde_json::json!(["single"])
+    );
+}
+
+#[test]
+fn virtual_cargo_workspace_reports_resolved_package_names() {
+    let root = temp_dir();
+    write_cargo_workspace(&root, true);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "workspaces"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["workspaces"]["enabled"], true);
+    assert_eq!(value["workspaces"]["source"], "Cargo.toml#[workspace]");
+    assert_eq!(
+        value["workspaces"]["packages"],
+        serde_json::json!(["a", "b"])
+    );
 }
 
 #[cfg(unix)]

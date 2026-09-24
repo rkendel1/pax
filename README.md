@@ -58,20 +58,22 @@ pax --version
 PAX also detects Python (`uv`, `pip`, Poetry, PDM), Rust (`cargo`), and Docker
 or Compose projects. `pax info --json` reports all detected components in a
 repository, including manifests, lockfiles, tool evidence, native dependency
-semantics, and static container services. Inspection never invokes Node,
-Python, Cargo, package managers, or the Docker daemon.
+semantics, and static container services. Cargo projects use read-only,
+offline `cargo metadata --no-deps` for authoritative workspace semantics.
+Inspection never invokes Node, Python, JavaScript/Python package managers, or
+the Docker daemon.
 
 `pax deps`, `pax scripts`, `pax workspaces`, and `pax lock` expose normalized
 package metadata, script definitions, workspace configuration, and lockfile
-state. All commands support `--json`; PAX only reads repository files and
-never invokes a package manager.
+state. All commands support `--json`; PAX does not install, resolve, or mutate
+dependencies while inspecting a project.
 
 `pax graph` reports project components and native dependency relationships with
 ecosystem-specific types and evidence. `pax reality` separates declared,
 resolved, installed, and runtime observations; runtime inspection is opt-in
 with `--live`. `pax drift` reports contradictions between those layers and
-never repairs them. Static observation does not require package managers,
-network access, or a Docker daemon.
+never repairs them. Static observation does not require network access or a
+Docker daemon.
 
 `pax drift` uses exit code 0 for no drift, 1 for detected drift, and 2 for
 ambiguous observations. Invalid input uses exit code 2.
@@ -129,8 +131,8 @@ shell, container runtime, or deployment provider.
 
 | Command | Boundary | Mutates | External process | Evidence |
 | --- | --- | --- | --- | --- |
-| `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | no | project files |
-| `graph`, `reality`, `drift` | native observation | no | only `--live` | manifests, locks, installed/runtime observations |
+| `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | Cargo metadata for Rust | project files and Cargo metadata |
+| `graph`, `reality`, `drift` | native observation | no | Cargo metadata; runtime only with `--live` | manifests, locks, installed/runtime observations |
 | `build`, `test`, `lint`, `typecheck` | resolved project operation | depends on native tool | yes | detected or overridden tool |
 | `run`, `x`, `install`, `add`, `remove` | native delegation | install or mutation commands may | yes | detected or overridden tool |
 | `exec` | exact delegation | depends on supplied command | yes | user-supplied command |
@@ -169,7 +171,7 @@ pax --help
 pax info
 ```
 
-The v0.1 release target matrix is intentionally explicit:
+The v0.2 release target matrix is intentionally explicit:
 
 | Platform | Rust target |
 | --- | --- |
@@ -178,6 +180,10 @@ The v0.1 release target matrix is intentionally explicit:
 | Linux x86_64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+Each release includes a `.tar.gz` archive for macOS and Linux, a `.zip`
+archive for Windows, and a `SHA256SUMS` file. Archives contain the native
+executable together with `README.md` and `LICENSE`.
 
 These are the supported release artifacts; other platforms are not advertised
 until they have reliable release builds and tests. Building from source remains

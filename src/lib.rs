@@ -52,6 +52,27 @@ struct NativeDependency {
     native_kind: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CargoPackage {
+    name: String,
+    manifest_path: String,
+    workspace_member: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CargoObservation {
+    manifest: String,
+    lockfile: Option<String>,
+    workspace: bool,
+    workspace_root: String,
+    workspace_members: Vec<String>,
+    packages: Vec<CargoPackage>,
+    dependencies: Vec<NativeDependency>,
+    source: String,
+}
+
 #[derive(Clone, Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ContainerInfo {
@@ -201,6 +222,8 @@ struct CommandOutput {
     components: Vec<Component>,
     native_dependencies: Vec<NativeDependency>,
     container: Option<ContainerInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cargo: Option<CargoObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,6 +233,7 @@ struct DependencyGroups {
     dev_dependencies: BTreeMap<String, String>,
     optional_dependencies: BTreeMap<String, String>,
     peer_dependencies: BTreeMap<String, String>,
+    native_dependencies: Vec<NativeDependency>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -242,7 +266,7 @@ struct ProjectInfo {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagerInfo {
-    name: Option<PackageManager>,
+    name: Option<String>,
     version: Option<String>,
     lockfile: Option<String>,
     selected_by: Option<String>,
@@ -282,6 +306,7 @@ struct GraphOutput {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     evidence: Vec<GraphEvidence>,
+    cargo: Option<CargoObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -306,6 +331,7 @@ struct RealityOutput {
     resolved: RealityLayer,
     installed: RealityLayer,
     runtime: RealityLayer,
+    cargo: Option<CargoObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -330,6 +356,7 @@ struct DriftOutput {
     live: bool,
     status: String,
     issues: Vec<DriftItem>,
+    cargo: Option<CargoObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -383,6 +410,7 @@ struct RepositoryDetection {
     components: Vec<Component>,
     native_dependencies: Vec<NativeDependency>,
     container: Option<ContainerInfo>,
+    cargo: Option<CargoObservation>,
 }
 
 #[derive(Clone, Debug)]
@@ -748,6 +776,24 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
             });
         }
     }
+    if let Some(cargo) = &detection.cargo {
+        for member in &cargo.workspace_members {
+            nodes.push(GraphNode {
+                id: member.clone(),
+                kind: "workspace-member".to_string(),
+                ecosystem: Ecosystem::Rust,
+            });
+            edges.push(GraphEdge {
+                from: cargo.workspace_root.clone(),
+                to: member.clone(),
+                kind: "workspace-member".to_string(),
+            });
+            evidence.push(GraphEvidence {
+                edge: format!("{} -> {member}", cargo.workspace_root),
+                evidence: vec![cargo.manifest.clone()],
+            });
+        }
+    }
     nodes.sort_by(|a, b| a.id.cmp(&b.id).then(a.kind.cmp(&b.kind)));
     nodes.dedup_by(|a, b| a.id == b.id && a.kind == b.kind);
     edges.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
@@ -759,6 +805,7 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
         nodes,
         edges,
         evidence,
+        cargo: detection.cargo.clone(),
     }
 }
 
@@ -869,6 +916,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         runtime: RealityLayer {
             observations: runtime,
         },
+        cargo: detection.cargo.clone(),
     }
 }
 
@@ -1034,6 +1082,7 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
             "ambiguous".to_string()
         },
         issues,
+        cargo: detection.cargo.clone(),
     }
 }
 
@@ -2142,6 +2191,7 @@ fn build_run_command(
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
+    let cargo = detect_cargo(root);
     let package_json_path = root.join("package.json");
     let package_json_data = if package_json_path.is_file() {
         Some(read_package_json(&package_json_path)?)
@@ -2202,7 +2252,11 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
                 })
                 .collect()
         });
-    let (manager, selection_notes) = select_manager(package_json_data.as_ref(), &lockfiles);
+    let (manager, mut selection_notes) = select_manager(package_json_data.as_ref(), &lockfiles);
+    if cargo.is_some() && !package_json {
+        selection_notes.clear();
+        selection_notes.push("Cargo.toml selects Cargo".to_string());
+    }
     let fallback_name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -2211,8 +2265,37 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
     let project_name = package_json_data
         .as_ref()
         .and_then(|data| data.name.clone())
+        .or_else(|| {
+            cargo.as_ref().and_then(|cargo| {
+                cargo
+                    .packages
+                    .iter()
+                    .find(|package| package.manifest_path == cargo.manifest)
+                    .map(|package| package.name.clone())
+            })
+        })
         .unwrap_or(fallback_name);
-    let (components, native_dependencies, container) = detect_components(root);
+    let (mut components, mut native_dependencies, container) = detect_components(root);
+    if let Some(cargo) = &cargo {
+        if let Some(component) = components
+            .iter_mut()
+            .find(|component| component.ecosystem == Ecosystem::Rust && component.path == ".")
+        {
+            component.workspace_packages = cargo.workspace_members.clone();
+            component.lockfiles = cargo.lockfile.iter().cloned().collect();
+            component.evidence.retain(|item| item.kind != "lockfile");
+            component
+                .evidence
+                .extend(cargo.lockfile.iter().map(|path| EvidenceItem {
+                    kind: "lockfile".to_string(),
+                    path: path.clone(),
+                }));
+        }
+        if cargo.source.starts_with("cargo metadata") {
+            native_dependencies.retain(|dependency| dependency.ecosystem != Ecosystem::Rust);
+            native_dependencies.extend(cargo.dependencies.iter().cloned());
+        }
+    }
 
     Ok(RepositoryDetection {
         root: root.to_path_buf(),
@@ -2229,6 +2312,146 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
         components,
         native_dependencies,
         container,
+        cargo,
+    })
+}
+
+fn display_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|path| path.to_str())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| path.to_str().unwrap_or("."))
+        .to_string()
+}
+
+fn detect_cargo(root: &Path) -> Option<CargoObservation> {
+    let manifest_path = root.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return None;
+    }
+    let manifest_contents = fs::read_to_string(&manifest_path).unwrap_or_default();
+    let declares_workspace = manifest_contents
+        .lines()
+        .any(|line| line.trim() == "[workspace]");
+    let metadata = Command::new("cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
+
+    if let Some(metadata) = metadata {
+        let workspace_root = metadata["workspace_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.to_path_buf());
+        let member_ids = metadata["workspace_members"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut packages = metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|package| {
+                let name = package["name"].as_str()?.to_string();
+                let manifest = PathBuf::from(package["manifest_path"].as_str()?);
+                let id = &package["id"];
+                Some(CargoPackage {
+                    name,
+                    manifest_path: display_path(&manifest, root),
+                    workspace_member: member_ids.iter().any(|member| member == id),
+                })
+            })
+            .collect::<Vec<_>>();
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut workspace_members = packages
+            .iter()
+            .filter(|package| package.workspace_member)
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>();
+        workspace_members.sort();
+        let mut dependencies = metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|package| package["dependencies"].as_array().into_iter().flatten())
+            .filter_map(|dependency| {
+                let name = dependency["name"].as_str()?.to_string();
+                let kind = match dependency["kind"].as_str() {
+                    Some("dev") => "development",
+                    Some("build") => "build",
+                    _ => "dependency",
+                };
+                Some(NativeDependency {
+                    name,
+                    specifier: dependency["req"].as_str().unwrap_or("*").to_string(),
+                    kind: kind.to_string(),
+                    ecosystem: Ecosystem::Rust,
+                    native_kind: if dependency["optional"].as_bool() == Some(true) {
+                        "optional".to_string()
+                    } else {
+                        kind.to_string()
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then(a.kind.cmp(&b.kind))
+                .then(a.specifier.cmp(&b.specifier))
+        });
+        dependencies
+            .dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.specifier == b.specifier);
+        let lockfile_path = workspace_root.join("Cargo.lock");
+        return Some(CargoObservation {
+            manifest: "Cargo.toml".to_string(),
+            lockfile: lockfile_path
+                .is_file()
+                .then(|| display_path(&lockfile_path, root)),
+            workspace: declares_workspace,
+            workspace_root: display_path(&workspace_root, root),
+            workspace_members,
+            packages,
+            dependencies,
+            source: "cargo metadata --no-deps --offline".to_string(),
+        });
+    }
+
+    let package_name = manifest_contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "name").then(|| value.trim().trim_matches(['\"', '\'']).to_string())
+    });
+    let members = parse_toml_list(&manifest_contents, "[workspace]", "members");
+    Some(CargoObservation {
+        manifest: "Cargo.toml".to_string(),
+        lockfile: root
+            .join("Cargo.lock")
+            .is_file()
+            .then(|| "Cargo.lock".to_string()),
+        workspace: declares_workspace,
+        workspace_root: ".".to_string(),
+        workspace_members: package_name.iter().cloned().chain(members).collect(),
+        packages: package_name
+            .map(|name| CargoPackage {
+                name,
+                manifest_path: "Cargo.toml".to_string(),
+                workspace_member: true,
+            })
+            .into_iter()
+            .collect(),
+        dependencies: Vec::new(),
+        source: "Cargo.toml fallback".to_string(),
     })
 }
 
@@ -2879,7 +3102,13 @@ fn build_output(
         .manager
         .as_ref()
         .and_then(|manager| manager.lockfile.clone())
-        .or_else(|| detection.lockfiles.first().cloned());
+        .or_else(|| detection.lockfiles.first().cloned())
+        .or_else(|| {
+            detection
+                .cargo
+                .as_ref()
+                .and_then(|cargo| cargo.lockfile.clone())
+        });
     let selected_by = detection
         .manager
         .as_ref()
@@ -2889,6 +3118,12 @@ fn build_output(
             "Detected {} package reality for {}",
             manager, detection.project_name
         ),
+        None if detection.cargo.is_some() => {
+            format!(
+                "Detected Cargo project reality for {}",
+                detection.project_name
+            )
+        }
         None => format!(
             "Unable to determine a supported package manager for {}",
             detection.project_name
@@ -2902,11 +3137,23 @@ fn build_output(
             root: detection.root.display().to_string(),
             name: detection.project_name,
             package_json: detection.package_json,
-            workspace: detection.workspace,
-            workspace_source: detection.workspace_source.clone(),
+            workspace: detection.workspace
+                || detection
+                    .cargo
+                    .as_ref()
+                    .is_some_and(|cargo| cargo.workspace),
+            workspace_source: detection.workspace_source.clone().or_else(|| {
+                detection
+                    .cargo
+                    .as_ref()
+                    .filter(|cargo| cargo.workspace)
+                    .map(|_| "Cargo.toml#[workspace]".to_string())
+            }),
         },
         manager: ManagerInfo {
-            name: manager_name,
+            name: manager_name
+                .map(|manager| manager.to_string())
+                .or_else(|| detection.cargo.as_ref().map(|_| "cargo".to_string())),
             version: manager_version,
             lockfile: manager_lockfile.clone(),
             selected_by,
@@ -2918,7 +3165,17 @@ fn build_output(
                 .package_json_data
                 .as_ref()
                 .and_then(|data| data.package_manager_field.clone()),
-            lockfiles: detection.lockfiles.clone(),
+            lockfiles: detection
+                .lockfiles
+                .iter()
+                .cloned()
+                .chain(
+                    detection
+                        .cargo
+                        .iter()
+                        .filter_map(|cargo| cargo.lockfile.clone()),
+                )
+                .collect(),
             workspace_files: detection.workspace_files,
             selection_notes: detection.selection_notes,
         },
@@ -2942,6 +3199,7 @@ fn build_output(
                 dev_dependencies: data.dev_dependencies,
                 optional_dependencies: data.optional_dependencies,
                 peer_dependencies: data.peer_dependencies,
+                native_dependencies: detection.native_dependencies.clone(),
             }
         }),
         scripts: (command == "scripts").then(|| {
@@ -2954,31 +3212,63 @@ fn build_output(
         workspaces: (command == "workspaces").then(|| WorkspaceOutput {
             enabled: detection.workspace
                 || detection
+                    .cargo
+                    .as_ref()
+                    .is_some_and(|cargo| cargo.workspace)
+                || detection
                     .components
                     .iter()
                     .any(|component| !component.workspace_packages.is_empty()),
-            source: detection.workspace_source.clone().or_else(|| {
-                detection
-                    .components
-                    .iter()
-                    .find(|component| !component.workspace_packages.is_empty())
-                    .map(|_| "Cargo.toml#[workspace]".to_string())
-            }),
+            source: detection
+                .workspace_source
+                .clone()
+                .or_else(|| {
+                    detection.cargo.as_ref().and_then(|cargo| {
+                        cargo
+                            .workspace
+                            .then(|| "Cargo.toml#[workspace]".to_string())
+                    })
+                })
+                .or_else(|| {
+                    detection
+                        .components
+                        .iter()
+                        .find(|component| !component.workspace_packages.is_empty())
+                        .map(|_| "Cargo.toml#[workspace]".to_string())
+                }),
             packages: detection
                 .workspace_packages
                 .iter()
                 .cloned()
                 .chain(
                     detection
+                        .cargo
+                        .iter()
+                        .flat_map(|cargo| cargo.workspace_members.iter().cloned()),
+                )
+                .chain(
+                    detection
                         .components
                         .iter()
                         .flat_map(|component| component.workspace_packages.iter().cloned()),
                 )
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect(),
         }),
         lock: (command == "lock").then(|| LockOutput {
-            found: !detection.lockfiles.is_empty(),
-            files: detection.lockfiles.clone(),
+            found: manager_lockfile.is_some(),
+            files: detection
+                .lockfiles
+                .iter()
+                .cloned()
+                .chain(
+                    detection
+                        .cargo
+                        .iter()
+                        .filter_map(|cargo| cargo.lockfile.clone()),
+                )
+                .collect(),
             selected: manager_lockfile,
             manager: manager_name,
         }),
@@ -2993,39 +3283,76 @@ fn build_output(
         components: detection.components.clone(),
         native_dependencies: detection.native_dependencies.clone(),
         container: detection.container.clone(),
+        cargo: detection.cargo.clone(),
     }
 }
 
 fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    diagnostics.push(Diagnostic {
-        level: if detection.package_json {
-            DiagnosticLevel::Ok
-        } else {
-            DiagnosticLevel::Error
-        },
-        check: "package.json",
-        message: if detection.package_json {
-            "package.json found".to_string()
-        } else {
-            "package.json is required to inspect a JavaScript package".to_string()
-        },
-    });
+    if let Some(cargo) = &detection.cargo {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "Cargo project",
+            message: format!("{} found", cargo.manifest),
+        });
+        diagnostics.push(Diagnostic {
+            level: if cargo.lockfile.is_some() {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warn
+            },
+            check: "Cargo lockfile",
+            message: cargo
+                .lockfile
+                .as_ref()
+                .map(|lockfile| format!("Found {lockfile}"))
+                .unwrap_or_else(|| "No Cargo.lock detected".to_string()),
+        });
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "Cargo workspace",
+            message: if cargo.workspace {
+                format!(
+                    "Workspace detected at {} with {} member(s)",
+                    cargo.workspace_root,
+                    cargo.workspace_members.len()
+                )
+            } else {
+                "Single-package Cargo project detected".to_string()
+            },
+        });
+    }
 
-    diagnostics.push(Diagnostic {
-        level: if detection.lockfiles.is_empty() {
-            DiagnosticLevel::Warn
-        } else {
-            DiagnosticLevel::Ok
-        },
-        check: "lockfile",
-        message: if detection.lockfiles.is_empty() {
-            "No supported lockfile detected".to_string()
-        } else {
-            format!("Found {}", detection.lockfiles.join(", "))
-        },
-    });
+    if detection.package_json || detection.cargo.is_none() {
+        diagnostics.push(Diagnostic {
+            level: if detection.package_json {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Error
+            },
+            check: "package.json",
+            message: if detection.package_json {
+                "package.json found".to_string()
+            } else {
+                "package.json is required to inspect a JavaScript package".to_string()
+            },
+        });
+
+        diagnostics.push(Diagnostic {
+            level: if detection.lockfiles.is_empty() {
+                DiagnosticLevel::Warn
+            } else {
+                DiagnosticLevel::Ok
+            },
+            check: "lockfile",
+            message: if detection.lockfiles.is_empty() {
+                "No supported lockfile detected".to_string()
+            } else {
+                format!("Found {}", detection.lockfiles.join(", "))
+            },
+        });
+    }
 
     let package_manager_field = detection
         .package_json_data
@@ -3079,17 +3406,21 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
             message: "Not enough evidence to verify package/lock consistency".to_string(),
         },
     };
-    diagnostics.push(package_lock_consistency);
+    if detection.package_json || detection.cargo.is_none() {
+        diagnostics.push(package_lock_consistency);
+    }
 
-    diagnostics.push(Diagnostic {
-        level: DiagnosticLevel::Ok,
-        check: "workspace configuration",
-        message: detection
-            .workspace_source
-            .as_ref()
-            .map(|source| format!("Workspace detected via {source}"))
-            .unwrap_or_else(|| "No workspace configuration detected".to_string()),
-    });
+    if detection.package_json || detection.cargo.is_none() {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "workspace configuration",
+            message: detection
+                .workspace_source
+                .as_ref()
+                .map(|source| format!("Workspace detected via {source}"))
+                .unwrap_or_else(|| "No workspace configuration detected".to_string()),
+        });
+    }
 
     for component in &detection.components {
         if component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1 {
@@ -3127,7 +3458,7 @@ fn render_human(output: &CommandOutput) -> String {
     let manager = output
         .manager
         .name
-        .map(|manager| manager.to_string())
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let manager = match &output.manager.version {
         Some(version) => format!("{manager} {version}"),
@@ -3147,6 +3478,10 @@ fn render_human(output: &CommandOutput) -> String {
         format!("Workspace     {workspace}"),
         format!("Lockfile      {lockfile}"),
     ];
+    if let Some(cargo) = &output.cargo {
+        lines.push(format!("Cargo root    {}", cargo.workspace_root));
+        lines.push(format!("Cargo members {}", cargo.workspace_members.len()));
+    }
     if !output.components.is_empty() {
         let ecosystems = output
             .components
@@ -3173,6 +3508,7 @@ fn render_human(output: &CommandOutput) -> String {
                 + dependencies.dev_dependencies.len()
                 + dependencies.optional_dependencies.len()
                 + dependencies.peer_dependencies.len()
+                + dependencies.native_dependencies.len()
         ));
     }
     if let Some(scripts) = &output.scripts {
@@ -3180,6 +3516,12 @@ fn render_human(output: &CommandOutput) -> String {
     }
     if let Some(workspaces) = &output.workspaces {
         lines.push(format!("Packages     {}", workspaces.packages.len()));
+        lines.extend(
+            workspaces
+                .packages
+                .iter()
+                .map(|package| format!("  - {package}")),
+        );
     }
     if let Some(lock) = &output.lock {
         lines.push(format!("Lockfiles    {}", lock.files.join(", ")));

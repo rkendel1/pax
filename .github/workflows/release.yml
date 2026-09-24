@@ -29,6 +29,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
+      - name: Verify release version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "pax") | .version')"
+          test "${RELEASE_VERSION#v}" = "$package_version"
 
   build:
     name: Build ${{ matrix.target }}
@@ -67,10 +74,14 @@ jobs:
           VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           version="${VERSION#v}"
+          mkdir package
+          cp README.md LICENSE package/
           if [[ "$TARGET" == *windows* ]]; then
-            7z a "pax-${version}-${TARGET}.zip" "target/${TARGET}/release/pax.exe"
+            cp "target/${TARGET}/release/pax.exe" package/
+            (cd package && 7z a "../pax-${version}-${TARGET}.zip" pax.exe README.md LICENSE)
           else
-            tar -czf "pax-${version}-${TARGET}.tar.gz" -C "target/${TARGET}/release" pax
+            cp "target/${TARGET}/release/pax" package/
+            tar -czf "pax-${version}-${TARGET}.tar.gz" -C package pax README.md LICENSE
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -86,6 +97,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum pax-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
