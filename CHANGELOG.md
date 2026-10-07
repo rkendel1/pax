@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- add `docs/PAX_AUDIT.md`, `docs/PAX_BOUNDARY.md`, and `docs/PAX_CAPABILITIES.md`
+- correct README claims that overstated `reality`, `--live`, and read-only scope
+- add `tests/boundary.rs`: boundary tests and tripwires for documented gaps
+  (no behavior change)
+
 ## 0.3.0
 
 - add the `pax.execution-result.v1` contract: `pax --json test` now emits a
