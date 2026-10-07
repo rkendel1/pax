@@ -1,11 +1,18 @@
 # PAX
 
-PAX is the universal, read-only project-tooling boundary.
+PAX inspects project artifacts and selected tooling information and produces
+structured observations. It can also delegate to the project's native tool.
 
-It inspects JavaScript, Python, Rust, and Docker projects through one fast Rust
-CLI without trying to replace the underlying native tool.
+It reads JavaScript, Python, Rust, and Docker projects through one Rust CLI
+without trying to replace the underlying native tool. It does not resolve
+dependencies, manage environments or runtimes, or run workloads on its own.
+See [docs/PAX_BOUNDARY.md](docs/PAX_BOUNDARY.md) for what PAX claims and does
+not claim, [docs/PAX_CAPABILITIES.md](docs/PAX_CAPABILITIES.md) for the
+capability matrix, and [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md) for the evidence
+and known gaps.
 
-“Read-only” describes PAX's observation model. Delegated commands such as
+The inspection and observation commands (`info` through `drift`) are
+read-only. Delegated commands such as
 `pax build`, `pax test`, `pax lint`, `pax typecheck`, `pax run`, `pax install`,
 `pax add`, `pax remove`, and `pax deploy` execute the selected native tool and
 may mutate project state exactly as that tool normally would.
@@ -46,7 +53,7 @@ pax --help
 pax --version
 ```
 
-`pax info` reports detected package-manager reality for the current repository, including lockfile, workspace, and manager-selection evidence.
+`pax info` reports the detected ecosystems, the selected package manager and why it was selected, lockfiles, workspaces, and declared dependencies for the current repository.
 
 `pax doctor` reports the same detection data plus core diagnostics for:
 
@@ -68,12 +75,18 @@ package metadata, script definitions, workspace configuration, and lockfile
 state. All commands support `--json`; PAX does not install, resolve, or mutate
 dependencies while inspecting a project.
 
-`pax graph` reports project components and native dependency relationships with
-ecosystem-specific types and evidence. `pax reality` separates declared,
-resolved, installed, and runtime observations; runtime inspection is opt-in
-with `--live`. `pax drift` reports contradictions between those layers and
-never repairs them. Static observation does not require network access or a
-Docker daemon.
+`pax graph` reports the declared dependency and workspace relationships with
+ecosystem-specific types and evidence. `pax reality` reports layered *presence*
+observations: which manifests exist (`declared`), which lockfiles exist
+(`resolved`), whether conventional install directories exist (`installed`), and
+`runtime`. It does not read lockfile contents or check installed packages, and
+`--live` does not currently observe anything: the `runtime` layer reports
+`unknown`. `pax drift` reports contradictions between those layers and never
+repairs them. Static observation does not require network access or a Docker
+daemon.
+
+Known limitations (Python and Compose parsing, unparseable manifests, no
+runtime or tool detection) are listed in [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
 
 `pax drift` uses exit code 0 for no drift, 1 for detected drift, and 2 for
 ambiguous observations. Invalid input uses exit code 2.
@@ -217,7 +230,9 @@ the structural representation, including the operation, project root,
 workspace, selected tool, native command, environment additions, working
 directory, support status, evidence, and selection reason.
 
-JSON output is a versioned machine-readable contract. Observation statuses are
+JSON output carries a version (`schemaVersion` or `schema_version`, currently
+`"1"`) but no compatibility policy has been written for observation
+documents; only `pax.execution-result.v1` has a documented consumer contract. Observation statuses are
 `match`, `drift`, `ambiguous`, or `unknown`; unknown evidence is never promoted
 to drift. Exit code `0` means success/match, `1` means delegated failure or
 drift, and `2` means invalid input or ambiguity.
