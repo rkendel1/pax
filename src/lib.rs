@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod execution_result;
+use execution_result::execute_with_result;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Ecosystem {
@@ -499,26 +502,10 @@ where
     S: Into<String>,
 {
     let cli = parse_args(args)?;
-    let cwd = env::current_dir().map_err(|error| CliError {
-        message: format!("failed to determine current directory: {error}"),
-        exit_code: 1,
-    })?;
-    let working_directory = cli
-        .dir
-        .as_deref()
-        .map(|dir| {
-            let path = if dir.is_absolute() {
-                dir.to_path_buf()
-            } else {
-                cwd.join(dir)
-            };
-            fs::canonicalize(&path).map_err(|error| CliError {
-                message: format!("invalid project directory {}: {error}", path.display()),
-                exit_code: 2,
-            })
-        })
-        .transpose()?
-        .unwrap_or(cwd);
+    if cli.json && !cli.dry_run && matches!(cli.command, CommandName::Test) {
+        return execute_with_result(&cli, Operation::Test);
+    }
+    let working_directory = resolve_working_directory(&cli)?;
 
     if let CommandName::Exec = cli.command {
         let (program, args) = cli.run_args.split_first().ok_or_else(|| CliError {
@@ -542,60 +529,9 @@ where
     ) {
         return dispatch_observation(&detection, cli.command, cli.live, cli.json);
     }
-    if cli.tool.is_none()
-        && matches!(
-            cli.command,
-            CommandName::Build
-                | CommandName::Test
-                | CommandName::Lint
-                | CommandName::Typecheck
-                | CommandName::Run
-                | CommandName::X
-                | CommandName::Install
-                | CommandName::Add
-                | CommandName::Remove
-        )
-        && detection.package_json
-        && detection
-            .package_json_data
-            .as_ref()
-            .and_then(|data| data.package_manager_field.as_ref())
-            .is_none()
-        && detection
-            .lockfiles
-            .iter()
-            .filter_map(|lockfile| manager_from_lockfile(lockfile))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            > 1
-        || cli.tool.is_none()
-            && matches!(
-                cli.command,
-                CommandName::Build
-                    | CommandName::Test
-                    | CommandName::Lint
-                    | CommandName::Typecheck
-                    | CommandName::Run
-                    | CommandName::X
-                    | CommandName::Install
-                    | CommandName::Add
-                    | CommandName::Remove
-            )
-            && detection.components.iter().any(|component| {
-                component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
-            })
-    {
+    if let Some(message) = selection_ambiguity(&cli, &detection) {
         return Err(CliError {
-            message: if detection.components.iter().any(|component| {
-                component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1
-            }) {
-                "ambiguous Python toolchain: multiple lockfiles detected; use --tool uv, --tool poetry, --tool pdm, or --tool pip".to_string()
-            } else {
-                format!(
-                    "multiple JavaScript package managers detected: {}\nuse --tool npm, --tool pnpm, --tool yarn, or --tool bun",
-                    detection.lockfiles.join(", ")
-                )
-            },
+            message,
             exit_code: 2,
         });
     }
@@ -654,6 +590,74 @@ where
     } else {
         Ok(render_human(&output))
     }
+}
+
+fn resolve_working_directory(cli: &ParsedCli) -> Result<PathBuf, CliError> {
+    let cwd = env::current_dir().map_err(|error| CliError {
+        message: format!("failed to determine current directory: {error}"),
+        exit_code: 1,
+    })?;
+    Ok(cli
+        .dir
+        .as_deref()
+        .map(|dir| {
+            let path = if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                cwd.join(dir)
+            };
+            fs::canonicalize(&path).map_err(|error| CliError {
+                message: format!("invalid project directory {}: {error}", path.display()),
+                exit_code: 2,
+            })
+        })
+        .transpose()?
+        .unwrap_or(cwd))
+}
+
+/// Returns the fail-closed ambiguity message when tool selection is not deterministic.
+fn selection_ambiguity(cli: &ParsedCli, detection: &RepositoryDetection) -> Option<String> {
+    let selects_tool = cli.tool.is_none()
+        && matches!(
+            cli.command,
+            CommandName::Build
+                | CommandName::Test
+                | CommandName::Lint
+                | CommandName::Typecheck
+                | CommandName::Run
+                | CommandName::X
+                | CommandName::Install
+                | CommandName::Add
+                | CommandName::Remove
+        );
+    let ambiguous_python = detection
+        .components
+        .iter()
+        .any(|component| component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1);
+    let ambiguous_javascript = detection.package_json
+        && detection
+            .package_json_data
+            .as_ref()
+            .and_then(|data| data.package_manager_field.as_ref())
+            .is_none()
+        && detection
+            .lockfiles
+            .iter()
+            .filter_map(|lockfile| manager_from_lockfile(lockfile))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1;
+    if !(selects_tool && (ambiguous_javascript || ambiguous_python)) {
+        return None;
+    }
+    Some(if ambiguous_python {
+        "ambiguous Python toolchain: multiple lockfiles detected; use --tool uv, --tool poetry, --tool pdm, or --tool pip".to_string()
+    } else {
+        format!(
+            "multiple JavaScript package managers detected: {}\nuse --tool npm, --tool pnpm, --tool yarn, or --tool bun",
+            detection.lockfiles.join(", ")
+        )
+    })
 }
 
 fn dispatch_observation(

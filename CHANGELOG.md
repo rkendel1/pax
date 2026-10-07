@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- add the `pax.execution-result.v1` contract: `pax --json test` now emits a
+  versioned execution result (status, reason, native exit code, optional Cargo
+  test counts) on stdout, with native output moved to stderr; `--dry-run --json`
+  plans and non-JSON output are unchanged
+
 ## 0.2.0
 
 - unify Cargo manifest, lockfile, workspace, package, and dependency observation

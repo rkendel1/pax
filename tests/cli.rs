@@ -1012,3 +1012,198 @@ fn delegated_arguments_after_separator_are_not_consumed_by_pax() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "--json");
 }
+
+// ---- pax.execution-result.v1 ----
+
+fn write_cargo_project(root: &Path, lib: &str) {
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write(&root.join("src/lib.rs"), lib);
+}
+
+fn pax_in(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap()
+}
+
+fn result_json(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout is not one JSON document: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn execution_result_passed_preserves_exit_code_and_counts() {
+    let root = temp_dir();
+    write_cargo_project(&root, "#[test]\nfn works() {}\n");
+    let output = pax_in(&root, &["--json", "test"]);
+    assert!(output.status.success());
+    let value = result_json(&output);
+    assert_eq!(value["schema"], "pax.execution-result.v1");
+    assert_eq!(value["operation"], "test");
+    assert_eq!(value["tool"], "cargo");
+    assert_eq!(value["status"], "passed");
+    assert_eq!(value["exit_code"], 0);
+    assert_eq!(value["tests"]["passed"], 1);
+    assert_eq!(value["tests"]["failed"], 0);
+}
+
+#[test]
+fn execution_result_failed_preserves_native_exit_code() {
+    let root = temp_dir();
+    write_cargo_project(&root, "#[test]\nfn breaks() { assert_eq!(1, 2); }\n");
+    let output = pax_in(&root, &["--json", "test"]);
+    assert_eq!(output.status.code(), Some(101));
+    let value = result_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["reason"], "tests-failed");
+    assert_eq!(value["exit_code"], 101);
+    assert_eq!(value["tests"]["failed"], 1);
+}
+
+#[test]
+fn execution_result_zero_tests_is_not_passed() {
+    let root = temp_dir();
+    write_cargo_project(&root, "pub fn value() {}\n");
+    let output = pax_in(&root, &["--json", "test"]);
+    // The native tool succeeded; PAX still must not claim tests passed.
+    assert!(output.status.success());
+    let value = result_json(&output);
+    assert_eq!(value["status"], "not_run");
+    assert_eq!(value["reason"], "no-tests-executed");
+    assert_eq!(value["exit_code"], 0);
+    assert_eq!(value["tests"]["passed"], 0);
+}
+
+#[test]
+fn execution_result_ignored_only_is_not_passed() {
+    let root = temp_dir();
+    write_cargo_project(&root, "#[test]\n#[ignore]\nfn skipped() {}\n");
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "not_run");
+    assert_eq!(value["tests"]["ignored"], 1);
+}
+
+#[test]
+fn execution_result_compilation_failure_is_failed() {
+    let root = temp_dir();
+    write_cargo_project(&root, "pub fn broken( {\n");
+    let output = pax_in(&root, &["--json", "test"]);
+    assert_eq!(output.status.code(), Some(101));
+    let value = result_json(&output);
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["reason"], "compilation-failed");
+    assert_eq!(value["exit_code"], 101);
+    assert!(value.get("tests").is_none());
+    // compiler diagnostics stay on stderr
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error"));
+}
+
+#[test]
+fn execution_result_workspace_sums_targets() {
+    let root = temp_dir();
+    write_cargo_workspace(&root, true);
+    write(&root.join("crates/a/src/lib.rs"), "#[test]\nfn a() {}\n");
+    write(&root.join("crates/b/src/lib.rs"), "#[test]\nfn b() {}\n");
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "passed");
+    assert_eq!(value["tests"]["passed"], 2);
+}
+
+#[test]
+fn execution_result_launch_failure_is_error_not_failed() {
+    let root = temp_dir();
+    write_cargo_project(&root, "#[test]\nfn works() {}\n");
+    let empty_path = temp_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "test"])
+        .current_dir(&root)
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value = result_json(&output);
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["reason"], "launch-failed");
+    assert!(value["exit_code"].is_null());
+}
+
+#[test]
+fn execution_result_ambiguous_selection_fails_closed() {
+    let root = temp_dir();
+    write(&root.join("package.json"), r#"{"scripts":{"test":"true"}}"#);
+    write(&root.join("package-lock.json"), "{}");
+    write(&root.join("yarn.lock"), "");
+    let output = pax_in(&root, &["--json", "test"]);
+    assert_eq!(output.status.code(), Some(2));
+    let value = result_json(&output);
+    assert_eq!(value["status"], "ambiguous");
+    assert!(value["tool"].is_null());
+    assert!(value["exit_code"].is_null());
+}
+
+#[test]
+fn execution_result_unsupported_operation_fails_closed() {
+    let root = temp_dir();
+    write(&root.join("package.json"), r#"{"scripts":{}}"#);
+    write(&root.join("package-lock.json"), "{}");
+    let output = pax_in(&root, &["--json", "test"]);
+    assert_eq!(output.status.code(), Some(2));
+    let value = result_json(&output);
+    assert_eq!(value["status"], "unsupported");
+    assert_eq!(value["reason"], "operation-unsupported");
+}
+
+#[test]
+fn execution_result_for_uninterpreted_tool_keeps_stdout_clean() {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        r#"{"packageManager":"npm@10.9.0","scripts":{"test":"echo native-output && exit 3"}}"#,
+    );
+    write(&root.join("package-lock.json"), "{}");
+    let output = pax_in(&root, &["--json", "test"]);
+    if String::from_utf8_lossy(&output.stderr).contains("failed") && output.stdout.is_empty() {
+        return; // npm unavailable in this environment
+    }
+    let value = result_json(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("native-output"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("native-output"));
+    if value["status"] != "error" {
+        assert_eq!(value["status"], "unsupported");
+        assert_eq!(value["reason"], "interpretation-unsupported");
+        assert_eq!(value["exit_code"], 3);
+    }
+}
+
+#[test]
+fn human_test_output_is_unchanged_without_json() {
+    let root = temp_dir();
+    write_cargo_project(&root, "#[test]\nfn works() {}\n");
+    let output = pax_in(&root, &["test"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("running 1 test"), "{stdout}");
+    assert!(stdout.contains("test result: ok."));
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
+#[test]
+fn dry_run_json_for_test_is_still_a_plan() {
+    let root = temp_dir();
+    write_cargo_project(&root, "pub fn value() {}\n");
+    let value = result_json(&pax_in(&root, &["--json", "--dry-run", "test"]));
+    assert!(value.get("schema").is_none());
+    assert!(value.get("status").is_none());
+    assert_eq!(value["operation"], "test");
+    assert_eq!(value["command"], serde_json::json!(["cargo", "test"]));
+    assert_eq!(value["supported"], true);
+}

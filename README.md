@@ -122,6 +122,73 @@ the provider CLI. Use `--tool fly`, `--tool vercel`, or `--tool netlify` to
 disambiguate or explicitly select a provider. `--dry-run` reports the selected
 provider, evidence, and canonical command without executing it.
 
+## Execution result contract
+
+`pax --dry-run --json test` produces a structured **plan**: what PAX will
+execute. `pax --json test` produces a structured **execution result**: what
+happened when PAX executed it. They are different contracts; the plan has no
+`schema` or `status` field and its meaning is unchanged.
+
+The execution result describes what PAX established about the delegated
+operation. It is not a general-purpose goal evaluator: whether a consumer's
+larger goal is satisfied remains the consumer's decision. Only `test` has an
+execution-result contract today. Without `--json`, `pax test` behaves exactly
+as before.
+
+stdout carries exactly one JSON document. Native stdout, native diagnostics, and
+PAX diagnostics go to stderr. Example:
+
+```json
+{
+  "schema": "pax.execution-result.v1",
+  "operation": "test",
+  "status": "failed",
+  "reason": "tests-failed",
+  "tool": "cargo",
+  "exit_code": 101,
+  "tests": { "passed": 1, "failed": 1, "ignored": 0, "measured": 0 }
+}
+```
+
+| Field | Presence | Meaning |
+| --- | --- | --- |
+| `schema` | always | `pax.execution-result.v1`. Consumers must reject or explicitly handle any other value; an incompatible semantic change requires a new identifier. |
+| `operation` | always | `test` |
+| `status` | always | `passed`, `failed`, `error`, `unsupported`, `ambiguous`, `not_run` |
+| `reason` | always | stable machine code refining `status` (below) |
+| `tool` | always | selected native tool, or `null` if none was selected |
+| `exit_code` | always | the native process exit status, unmodified (`101` stays `101`); `null` if no native process ran to a normal exit |
+| `tests` | optional | `passed`, `failed`, `ignored`, `measured` summed over every libtest summary; present only when every summary line parsed |
+
+The semantic fields contain no timestamps, process ids, or paths. Process exit
+status of `pax` itself mirrors the native status when a process ran, and PAX's
+existing fail-closed codes otherwise (`2` ambiguous/unsupported selection, `1`
+error).
+
+| `status` | `reason` | Established when |
+| --- | --- | --- |
+| `passed` | `tests-passed` | Cargo exited 0, every libtest summary was observed, and at least one test passed. |
+| `failed` | `compilation-failed` | Cargo's `build-finished` message reports `success: false`. |
+| `failed` | `tests-failed` | A libtest summary reports failed tests. |
+| `failed` | `native-exit-nonzero` / `terminated-by-signal` | Cargo ran and exited non-zero (or was killed) without more specific evidence. |
+| `not_run` | `no-tests-executed` | Cargo exited 0 and libtest reports zero passed and zero measured tests (zero tests, or only ignored tests). |
+| `unsupported` | `no-libtest-evidence` | Cargo exited 0 but PAX cannot establish that tests executed (`--no-run`, `-- --list`, `harness = false` targets, unparseable summaries). Exit 0 alone is not treated as a pass. |
+| `unsupported` | `interpretation-unsupported` | The selected tool (npm/pnpm/yarn/bun scripts, Python, Docker) is run and its `exit_code` preserved, but PAX has no authoritative test semantics for it. Do not treat `exit_code` as semantic. |
+| `unsupported` | `operation-unsupported` | PAX's existing selection refuses the operation (for example no `test` script). Nothing is executed. |
+| `ambiguous` | `ambiguous-selection` | PAX's existing selection is ambiguous (multiple lockfiles). Nothing is executed and no fallback tool is chosen. |
+| `error` | `launch-failed` | The native tool could not be launched. Never reported as `failed`. |
+| `error` | `invalid-project-directory` / `detection-failed` | PAX could not inspect the project. |
+
+For Cargo, PAX runs `cargo test --message-format=json-render-diagnostics`
+(skipped if you pass your own `--message-format`) and reads cargo's stable
+`build-finished` and artifact messages. libtest's JSON format is nightly-only,
+so counts come from its stable `test result:` summary lines; they are optional
+and omitted rather than guessed. Doctests, multiple test targets, and workspaces
+are covered because every summary is summed.
+
+Zero tests: a project in which no test executes reports `not_run` with
+`exit_code: 0`, never `passed`.
+
 ## Architecture audit contract
 
 PAX owns detection, planning, observation, and evidence. Native tools remain
