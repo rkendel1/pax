@@ -1207,3 +1207,54 @@ fn dry_run_json_for_test_is_still_a_plan() {
     assert_eq!(value["command"], serde_json::json!(["cargo", "test"]));
     assert_eq!(value["supported"], true);
 }
+
+#[test]
+fn graph_attributes_cargo_dependencies_to_the_declaring_package_only() {
+    let root = temp_dir();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\nresolver = \"2\"\n",
+    );
+    write(
+        &root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncore-lib = { path = \"../core\", package = \"core\" }\nserde = \"1\"\n\n[dev-dependencies]\nserde = \"1\"\n",
+    );
+    write(&root.join("crates/app/src/lib.rs"), "");
+    write(
+        &root.join("crates/core/Cargo.toml"),
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n",
+    );
+    write(&root.join("crates/core/src/lib.rs"), "");
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "graph"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let edges_from = |from: &str| {
+        let mut edges = graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["from"] == from && edge["kind"] != "workspace-member")
+            .map(|edge| {
+                format!(
+                    "{}:{}",
+                    edge["to"].as_str().unwrap(),
+                    edge["kind"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.sort();
+        edges
+    };
+    assert_eq!(edges_from("crates/core"), ["serde:runtime-dependency"]);
+    assert_eq!(
+        edges_from("crates/app"),
+        [
+            "core:runtime-dependency",
+            "serde:development-dependency",
+            "serde:runtime-dependency"
+        ]
+    );
+}

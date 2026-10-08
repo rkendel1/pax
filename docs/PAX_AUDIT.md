@@ -284,6 +284,21 @@ declared and inferred values without marking which is which.
 | Compute `docs/pax.md` | "Multi-package workspaces run as the single project" under unsupported | code does not refuse |
 | Compute docs | "versioned JSON (`schemaVersion: "1"`)" | no compatibility policy behind the version |
 
+## Defects reported by a consumer (Chip adapter, post-0.3.0)
+
+| # | Defect | Status |
+| --- | --- | --- |
+| 1 | `pax graph` attributed the workspace-wide Cargo dependency union to every member, with evidence pointing at a manifest that did not declare the edge (including self-edges). | Fixed after 0.4.0: Rust component edges come from `cargo metadata`'s per-package dependencies (`tests/cli.rs::graph_attributes_cargo_dependencies_to_the_declaring_package_only`). `info`/`deps` still report only the union (`nativeDependencies` has no package attribution); when `cargo metadata` is unavailable, `graph` falls back to the union. |
+| 2 | `observe` following symlinks out of the project. | The reported repro does not escape: both links resolve inside the project root. `file:` and `path:` scopes already refuse targets whose canonical path is outside the root. A real gap was found while checking: `mod x;` resolution could read a symlinked module file outside the root. It now yields an `artifact_outside_root` diagnostic and is not read. |
+| 3 | Version unchanged from 0.3.0 while `observe` was added. | Fixed in 0.4.0. |
+| 4 | `graph` mixes identifier types (absolute path for `workspace-member` edges, relative dirs, package names). | **Open.** Changing `graph` identifiers changes existing output, so it needs a versioned `graph` schema. |
+| 5 | `target/` and `target-linux/` tracked in git. | Untracked and ignored. |
+| 6 | `graph` has no scoping or bound; output is the whole workspace. | **Open.** Use `observe` for bounded questions. |
+| 7 | `observe` input inconsistencies (`path:` and `--max-files 0`). | Fixed: empty scope values and non-positive limits are `invalid_scope` / `invalid_limit`; `path:.` means the whole project. |
+
+Until #4 and #6 are addressed, treat `graph` as a declared-relationship summary
+whose identifiers must not be joined across edge kinds without inspecting them.
+
 ## Product gaps (PAX-owned, prioritized)
 
 1. **P0** Stop `--live` and `runtime` from implying observation (remove the

@@ -42,14 +42,14 @@ pax [--json] observe [--scope <scope>] [--max-files <n>] [--max-bytes <n>] [--ma
 | `crate:<package>[/<kind>[/<name>]]` | one workspace package, or one target of it (`a/lib`, `a/bin/tool`, `a/test/it`) |
 | `module:<crate-id>::crate[::<mod>...]` | one module subtree; only the path to it is walked |
 | `file:<path>` | one `.rs` file, read in isolation |
-| `path:<prefix>` | `.rs` files and manifests under a path prefix |
+| `path:<prefix>` | `.rs` files and manifests under a path prefix (`path:.` for the whole project; an empty value is invalid) |
 
 Crate ids are `<package>/lib` or `<package>/<bin\|test\|bench\|example>/<name>`.
 Module ids are `<crate-id>::crate::<mod>::<mod>`.
 
 ## Bounds
 
-Defaults: `--max-files 200`, `--max-bytes 4194304`, `--max-facts 5000`.
+Limits must be positive integers. Defaults: `--max-files 200`, `--max-bytes 4194304`, `--max-facts 5000`.
 
 - `max_files` bounds *both* files read and directory entries listed or probed.
 - `max_bytes` bounds source bytes read (checked before each read).
@@ -121,7 +121,7 @@ Rust's path rules applied by PAX, not by `rustc`.
 
 States are `unsupported`, `unparseable`, `unreadable`, `unresolved`. Codes:
 `syntax_error`, `not_utf8`, `artifact_unreadable`, `mod_path_attribute`,
-`custom_target_path`, `module_file_missing`, `module_file_ambiguous`,
+`custom_target_path`, `artifact_outside_root`, `module_file_missing`, `module_file_ambiguous`,
 `module_file_revisited`, `source_structure_unsupported`, `no_supported_project`,
 `cargo_metadata_unavailable`. A diagnostic means PAX did not establish something
 and said so; it never falls back to guessed structure.

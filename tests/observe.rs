@@ -461,6 +461,8 @@ fn invalid_scopes_and_limits_are_typed_errors() {
         "module:demo/lib::mod::a",
         "file:../outside.rs",
         "path:/etc",
+        "path:",
+        "file:",
         "path:src/../..",
     ] {
         let error = refusal(&root, &["--scope", scope]);
@@ -759,4 +761,33 @@ fn separate_crates_may_share_a_module_file() {
     let declared = ids(&observation, "declaration.located_at", "subject");
     assert!(declared.contains("demo/test/one::crate::common::helper"));
     assert!(declared.contains("demo/test/two::crate::common::helper"));
+}
+
+#[cfg(unix)]
+#[test]
+fn module_files_cannot_be_read_through_symlinks_leaving_the_root() {
+    let root = temp_dir();
+    let outside = temp_dir();
+    write(&outside.join("leak.rs"), "pub fn secret_outside() {}\n");
+    package(&root, "", "demo", "", "mod linked;\nmod inside;\n");
+    write(&root.join("real/inside.rs"), "pub fn fine() {}\n");
+    std::os::unix::fs::symlink(outside.join("leak.rs"), root.join("src/linked.rs")).unwrap();
+    // A symlink that stays inside the project is still ordinary project content.
+    std::os::unix::fs::symlink(root.join("real/inside.rs"), root.join("src/inside.rs")).unwrap();
+    let observation = observe(&root, &[]);
+    let declared = ids(&observation, "declaration.located_at", "subject");
+    assert!(
+        !declared.iter().any(|id| id.contains("secret_outside")),
+        "{declared:?}"
+    );
+    assert!(declared.contains("demo/lib::crate::inside::fine"));
+    assert_eq!(
+        diagnostics(&observation, "artifact_outside_root")[0]["state"],
+        "unreadable"
+    );
+    // Explicit scopes reach the same refusal.
+    assert_eq!(
+        refusal(&root, &["--scope", "file:src/linked.rs"])["code"],
+        "invalid_scope"
+    );
 }

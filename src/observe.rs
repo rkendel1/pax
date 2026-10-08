@@ -269,12 +269,12 @@ fn parse_scope(spec: Option<&str>) -> Observed<Scope> {
             "invalid_scope",
             format!(
                 "invalid scope {spec:?}; expected project, crate:<package>[/<kind>[/<name>]], \
-                 module:<crate-id>::crate[::<module>...], file:<path>, or path:<prefix>"
+                 module:<crate-id>::crate[::<module>...], file:<path>, or path:<prefix> (use path:. for the whole project)"
             ),
         )
     };
     let (kind, value) = spec.split_once(':').ok_or_else(invalid)?;
-    if value.is_empty() && kind != "path" {
+    if value.is_empty() {
         return Err(invalid());
     }
     match kind {
@@ -326,19 +326,23 @@ fn normalize_relative(value: &str) -> Observed<String> {
 }
 
 fn parse_limits(options: &ObserveOptions) -> Observed<Limits> {
-    fn number<T: std::str::FromStr>(
+    fn number<T: std::str::FromStr + Default + PartialOrd>(
         name: &'static str,
         raw: &Option<String>,
         default: T,
     ) -> Observed<T> {
         match raw {
             None => Ok(default),
-            Some(raw) => raw.parse::<T>().map_err(|_| {
-                refuse(
-                    "invalid_limit",
-                    format!("--{name} requires a non-negative integer, got {raw:?}"),
-                )
-            }),
+            Some(raw) => raw
+                .parse::<T>()
+                .ok()
+                .filter(|value| *value > T::default())
+                .ok_or_else(|| {
+                    refuse(
+                        "invalid_limit",
+                        format!("--{name} requires a positive integer, got {raw:?}"),
+                    )
+                }),
         }
     }
     Ok(Limits {
@@ -536,6 +540,21 @@ impl<'a> Obs<'a> {
             ));
         }
         let path = self.abs(rel);
+        // Never read through a symlink that leaves the project root (e.g. `mod x;`
+        // resolving to a linked file).
+        let contained = match (fs::canonicalize(&path), fs::canonicalize(self.root)) {
+            (Ok(path), Ok(root)) => path.starts_with(root),
+            _ => true, // unreadable paths are reported by the metadata check below
+        };
+        if !contained {
+            self.diagnose(
+                "artifact_outside_root",
+                DiagnosticState::Unreadable,
+                format!("{rel} resolves outside the project root; not read"),
+                at_file(rel),
+            );
+            return Ok(None);
+        }
         let size = match fs::metadata(&path) {
             Ok(meta) => meta.len(),
             Err(error) => {

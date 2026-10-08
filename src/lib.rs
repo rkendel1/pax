@@ -74,6 +74,10 @@ struct CargoObservation {
     workspace_members: Vec<String>,
     packages: Vec<CargoPackage>,
     dependencies: Vec<NativeDependency>,
+    /// Declared dependencies per package, keyed by manifest path. Not serialized, so
+    /// existing `info`/`graph` JSON is unchanged. Empty without `cargo metadata`.
+    #[serde(skip)]
+    package_dependencies: BTreeMap<String, Vec<NativeDependency>>,
     source: String,
 }
 
@@ -755,11 +759,34 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
             kind: "component".to_string(),
             ecosystem: component.ecosystem,
         });
-        for dependency in detection
-            .native_dependencies
-            .iter()
-            .filter(|dependency| dependency.ecosystem == component.ecosystem)
-        {
+        // Cargo metadata knows which package declares what; the ecosystem-wide union
+        // must not be attributed to every member.
+        let manifest_path = if component.path == "." {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{}/Cargo.toml", component.path)
+        };
+        let per_package = detection
+            .cargo
+            .as_ref()
+            .filter(|_| component.ecosystem == Ecosystem::Rust)
+            .filter(|cargo| !cargo.package_dependencies.is_empty())
+            .map(|cargo| {
+                cargo
+                    .package_dependencies
+                    .get(&manifest_path)
+                    .map_or(&[][..], Vec::as_slice)
+            });
+        for dependency in per_package.map_or_else(
+            || {
+                detection
+                    .native_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.ecosystem == component.ecosystem)
+                    .collect::<Vec<_>>()
+            },
+            |dependencies| dependencies.iter().collect(),
+        ) {
             let id = dependency.name.clone();
             nodes.push(GraphNode {
                 id: id.clone(),
@@ -816,7 +843,12 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
     }
     nodes.sort_by(|a, b| a.id.cmp(&b.id).then(a.kind.cmp(&b.kind)));
     nodes.dedup_by(|a, b| a.id == b.id && a.kind == b.kind);
-    edges.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
+    edges.sort_by(|a, b| {
+        a.from
+            .cmp(&b.from)
+            .then(a.to.cmp(&b.to))
+            .then(a.kind.cmp(&b.kind))
+    });
     edges.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
     evidence.sort_by(|a, b| a.edge.cmp(&b.edge));
     GraphOutput {
@@ -2432,39 +2464,47 @@ fn detect_cargo(root: &Path) -> Option<CargoObservation> {
             .map(|package| package.name.clone())
             .collect::<Vec<_>>();
         workspace_members.sort();
-        let mut dependencies = metadata["packages"]
+        let package_dependencies = metadata["packages"]
             .as_array()
             .into_iter()
             .flatten()
-            .flat_map(|package| package["dependencies"].as_array().into_iter().flatten())
-            .filter_map(|dependency| {
-                let name = dependency["name"].as_str()?.to_string();
-                let kind = match dependency["kind"].as_str() {
-                    Some("dev") => "development",
-                    Some("build") => "build",
-                    _ => "dependency",
-                };
-                Some(NativeDependency {
-                    name,
-                    specifier: dependency["req"].as_str().unwrap_or("*").to_string(),
-                    kind: kind.to_string(),
-                    ecosystem: Ecosystem::Rust,
-                    native_kind: if dependency["optional"].as_bool() == Some(true) {
-                        "optional".to_string()
-                    } else {
-                        kind.to_string()
-                    },
-                })
+            .filter_map(|package| {
+                let manifest =
+                    display_path(&PathBuf::from(package["manifest_path"].as_str()?), root);
+                let mut dependencies = package["dependencies"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|dependency| {
+                        let name = dependency["name"].as_str()?.to_string();
+                        let kind = match dependency["kind"].as_str() {
+                            Some("dev") => "development",
+                            Some("build") => "build",
+                            _ => "dependency",
+                        };
+                        Some(NativeDependency {
+                            name,
+                            specifier: dependency["req"].as_str().unwrap_or("*").to_string(),
+                            kind: kind.to_string(),
+                            ecosystem: Ecosystem::Rust,
+                            native_kind: if dependency["optional"].as_bool() == Some(true) {
+                                "optional".to_string()
+                            } else {
+                                kind.to_string()
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                sort_dependencies(&mut dependencies);
+                Some((manifest, dependencies))
             })
+            .collect::<BTreeMap<_, _>>();
+        let mut dependencies = package_dependencies
+            .values()
+            .flatten()
+            .cloned()
             .collect::<Vec<_>>();
-        dependencies.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then(a.kind.cmp(&b.kind))
-                .then(a.specifier.cmp(&b.specifier))
-        });
-        dependencies
-            .dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.specifier == b.specifier);
+        sort_dependencies(&mut dependencies);
         let lockfile_path = workspace_root.join("Cargo.lock");
         return Some(CargoObservation {
             manifest: "Cargo.toml".to_string(),
@@ -2476,6 +2516,7 @@ fn detect_cargo(root: &Path) -> Option<CargoObservation> {
             workspace_members,
             packages,
             dependencies,
+            package_dependencies,
             source: "cargo metadata --no-deps --offline".to_string(),
         });
     }
@@ -2503,8 +2544,20 @@ fn detect_cargo(root: &Path) -> Option<CargoObservation> {
             .into_iter()
             .collect(),
         dependencies: Vec::new(),
+        package_dependencies: BTreeMap::new(),
         source: "Cargo.toml fallback".to_string(),
     })
+}
+
+fn sort_dependencies(dependencies: &mut Vec<NativeDependency>) {
+    dependencies.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.kind.cmp(&b.kind))
+            .then(a.specifier.cmp(&b.specifier))
+    });
+    dependencies
+        .dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.specifier == b.specifier);
 }
 
 fn detect_components(
