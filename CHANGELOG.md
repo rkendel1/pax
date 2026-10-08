@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - add `pax observe` (`pax.observation.v1`): bounded, deterministic project-structure
   observation (artifacts, workspace members, declared dependencies, and Rust
