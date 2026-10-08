@@ -238,6 +238,7 @@ fn observation_commands_execute_no_tool_and_write_nothing() {
         &["--json", "workspaces"],
         &["--json", "lock"],
         &["--json", "graph"],
+        &["--json", "observe"],
         &["--json", "reality"],
         &["--json", "reality", "--live"],
         &["--json", "drift", "--live"],

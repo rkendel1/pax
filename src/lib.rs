@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod execution_result;
+mod observe;
 use execution_result::execute_with_result;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -114,6 +115,7 @@ enum CommandName {
     Graph,
     Reality,
     Drift,
+    Observe,
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +509,18 @@ where
     }
     let working_directory = resolve_working_directory(&cli)?;
 
+    if let CommandName::Observe = cli.command {
+        return observe::observe(&working_directory, &cli.observe, cli.json);
+    }
+    if !cli.observe.is_empty() {
+        return Err(CliError {
+            message:
+                "--scope, --max-files, --max-bytes, and --max-facts apply only to `pax observe`"
+                    .to_string(),
+            exit_code: 2,
+        });
+    }
+
     if let CommandName::Exec = cli.command {
         let (program, args) = cli.run_args.split_first().ok_or_else(|| CliError {
             message: format!("pax exec requires a command\n\n{}", usage()),
@@ -579,7 +593,9 @@ where
         CommandName::Scripts => build_output("scripts", detection, false),
         CommandName::Workspaces => build_output("workspaces", detection, false),
         CommandName::Lock => build_output("lock", detection, false),
-        CommandName::Graph | CommandName::Reality | CommandName::Drift => unreachable!(),
+        CommandName::Graph | CommandName::Reality | CommandName::Drift | CommandName::Observe => {
+            unreachable!()
+        }
     };
 
     if cli.json {
@@ -1146,6 +1162,7 @@ struct ParsedCli {
     dir: Option<PathBuf>,
     dry_run: bool,
     live: bool,
+    observe: observe::ObserveOptions,
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli, CliError>
@@ -1183,6 +1200,7 @@ where
                 | "graph"
                 | "reality"
                 | "drift"
+                | "observe"
         )
     {
         return Err(CliError {
@@ -1196,6 +1214,7 @@ where
     let mut live = false;
     let mut tool = None;
     let mut dir = None;
+    let mut observe = observe::ObserveOptions::default();
     let mut filtered = Vec::with_capacity(args.len());
     let mut index = 0;
     let mut options = true;
@@ -1222,6 +1241,27 @@ where
                     })?
                     .clone(),
             );
+        } else if options
+            && matches!(
+                arg.as_str(),
+                "--scope" | "--max-files" | "--max-bytes" | "--max-facts"
+            )
+        {
+            let flag = arg.clone();
+            index += 1;
+            let value = args
+                .get(index)
+                .ok_or_else(|| CliError {
+                    message: format!("pax {flag} requires a value"),
+                    exit_code: 2,
+                })?
+                .clone();
+            match flag.as_str() {
+                "--scope" => observe.scope = Some(value),
+                "--max-files" => observe.max_files = Some(value),
+                "--max-bytes" => observe.max_bytes = Some(value),
+                _ => observe.max_facts = Some(value),
+            }
         } else if options && arg == "--dir" {
             index += 1;
             dir = Some(PathBuf::from(args.get(index).ok_or_else(|| CliError {
@@ -1280,6 +1320,7 @@ where
         [command] if command == "graph" => (CommandName::Graph, Vec::new()),
         [command] if command == "reality" => (CommandName::Reality, Vec::new()),
         [command] if command == "drift" => (CommandName::Drift, Vec::new()),
+        [command] if command == "observe" => (CommandName::Observe, Vec::new()),
         [command] if command == "run" => {
             return Err(CliError {
                 message: format!("pax run requires a target\n\n{}", usage()),
@@ -1327,6 +1368,7 @@ where
         dir,
         dry_run,
         live,
+        observe,
     })
 }
 
@@ -1338,6 +1380,7 @@ Usage: pax [OPTIONS] COMMAND [ARGS...]
 Inspection:
   info, doctor, deps, scripts, workspaces, lock
   graph, reality, drift
+  observe            bounded deterministic project-structure observation
 Project operations (delegated to native tools):
   build, test, lint, typecheck
 Execution (delegated to native tools):
@@ -1349,6 +1392,10 @@ Options:
   --dry-run          preview a delegated command without executing it
   --json             emit machine-readable output for automation
   --live             allow runtime observations for reality/drift
+  --scope <scope>    observe: project (default), crate:<pkg>, module:<id>, file:<path>, path:<prefix>
+  --max-files <n>    observe: bound on files read and directory entries listed (default 200)
+  --max-bytes <n>    observe: bound on source bytes read (default 4194304)
+  --max-facts <n>    observe: bound on facts returned (default 5000)
   -h, --help         show this help
   -V, --version      show the package version
 
@@ -1368,6 +1415,7 @@ fn command_usage(command: &str) -> String {
         "install" => "Usage: pax install [package...]\nInstall declared project dependencies or named packages.".to_string(),
         "graph" => "Usage: pax graph [--json]\nInspect static component and dependency relationships.".to_string(),
         "reality" => "Usage: pax reality [--live] [--json]\nCompare declared, resolved, installed, and runtime observations.".to_string(),
+        "observe" => "Usage: pax observe [--scope <scope>] [--max-files <n>] [--max-bytes <n>] [--max-facts <n>] [--json]\nReport bounded, deterministic project-structure facts with provenance. Rust source structure only.\nScopes: project, crate:<package>[/<kind>[/<name>]], module:<crate-id>::crate[::<module>...], file:<path>, path:<prefix>.\nExceeding a bound is an error, never a silent truncation.".to_string(),
         "drift" => "Usage: pax drift [--live] [--json]\nReport contradictions without repairing them.".to_string(),
         _ => unreachable!(),
     }

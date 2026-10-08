@@ -29,6 +29,7 @@ pax lock
 pax graph
 pax reality
 pax drift
+pax observe --scope crate:pax
 pax reality --live
 pax drift --live
 pax build
@@ -48,12 +49,15 @@ pax --json doctor
 pax --json graph
 pax --json reality
 pax --json drift
+pax --json observe --scope module:pax/lib::crate::observe
 pax --dir path/to/project info
 pax --help
 pax --version
 ```
 
 `pax info` reports the detected ecosystems, the selected package manager and why it was selected, lockfiles, workspaces, and declared dependencies for the current repository.
+
+`pax observe` reports bounded, deterministic project-structure facts (artifacts, workspace members, declared dependencies, and Rust crate/module/file/declaration structure), each with provenance (`declared`, `observed`, or `resolved`; never `verified`). PAX provides deterministic project observation. It does not determine relevance, intent, plans, correctness, goal satisfaction, or change safety. Rust only; exceeding a bound is an error, not a truncation. See [docs/PAX_OBSERVATION.md](docs/PAX_OBSERVATION.md).
 
 `pax doctor` reports the same detection data plus core diagnostics for:
 
@@ -212,6 +216,7 @@ shell, container runtime, or deployment provider.
 | Command | Boundary | Mutates | External process | Evidence |
 | --- | --- | --- | --- | --- |
 | `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | Cargo metadata for Rust | project files and Cargo metadata |
+| `observe` | bounded structure observation | no | Cargo metadata (Cargo scopes) | manifests and Rust source; see [docs/PAX_OBSERVATION.md](docs/PAX_OBSERVATION.md) |
 | `graph`, `reality`, `drift` | native observation | no | Cargo metadata; runtime only with `--live` | manifests, locks, installed/runtime observations |
 | `build`, `test`, `lint`, `typecheck` | resolved project operation | depends on native tool | yes | detected or overridden tool |
 | `run`, `x`, `install`, `add`, `remove` | native delegation | install or mutation commands may | yes | detected or overridden tool |

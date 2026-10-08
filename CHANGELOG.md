@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- add `pax observe` (`pax.observation.v1`): bounded, deterministic project-structure
+  observation (artifacts, workspace members, declared dependencies, and Rust
+  crate/module/file/declaration structure) with per-fact provenance, explicit
+  limits, and typed errors; see `docs/PAX_OBSERVATION.md`. Additive: existing
+  commands and output are unchanged. Adds `syn` and `proc-macro2` dependencies
 - add `docs/PAX_AUDIT.md`, `docs/PAX_BOUNDARY.md`, and `docs/PAX_CAPABILITIES.md`
 - correct README claims that overstated `reality`, `--live`, and read-only scope
 - add `tests/boundary.rs`: boundary tests and tripwires for documented gaps

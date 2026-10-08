@@ -80,7 +80,7 @@ Two discrepancies with this picture exist today and are documented, not fixed:
 ## Boundary rules
 
 1. **Observation commands are read-only.** `info`, `doctor`, `deps`, `scripts`,
-   `workspaces`, `lock`, `graph`, `reality`, `drift` (with or without `--live`)
+   `workspaces`, `lock`, `graph`, `observe`, `reality`, `drift` (with or without `--live`)
    run no package manager, runtime, or Docker, and write no files. The only
    process they start is `cargo metadata --no-deps --offline` for projects with a
    `Cargo.toml`. Enforced by `tests/boundary.rs`.
@@ -107,7 +107,7 @@ Two discrepancies with this picture exist today and are documented, not fixed:
 | Deployment | `deploy` delegates to `fly`/`vercel`/`netlify` selected from config-file evidence. PAX does not deploy on its own and says nothing about deployability. | `select_deploy_provider` |
 | Runtime management | PAX does not install, select, or probe Node, Python, or Rust versions. `doctor`'s `runtime` field is always `null`. | `detect_node_runtime` |
 | Security / provenance | PAX output is not provenance. A tool selected by name is not verified (no path, hash, or signature is recorded). | no such code exists |
-| Application semantics | PAX does not read source code. It reads manifests. | `detect_*` |
+| Application semantics | Outside `pax observe`, PAX does not read source code; it reads manifests. `pax observe` parses Rust source for structure only (modules, declaration names and locations) and assigns no meaning to it. See [PAX_OBSERVATION.md](PAX_OBSERVATION.md). | `detect_*`, `src/observe.rs` |
 | Business semantics | Out of scope. | — |
 | Agent reasoning | PAX is not Chip; it contains no model, planner, retry, or repair logic. | — |
 

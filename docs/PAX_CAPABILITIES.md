@@ -23,6 +23,7 @@ what the code does, not what the README says. Details and evidence:
 | Runtime observation (`--live`) | ❌ names `docker compose ps`, runs nothing | implement or remove the flag's claim | PAX (if kept) | **P0** (honesty) |
 | Tool detection (is `npm`/`cargo` on PATH, version) | ❌ not implemented (only `cargo` is invoked for metadata) | observation only, with path and version | PAX | P2 |
 | Runtime/platform requirement extraction (`engines`, `requires-python`, `rust-version`, `.nvmrc`) | ❌ none read | declared-requirement observation | PAX | P1 |
+| Project structure observation (`pax observe`: Rust crate/module/file/declaration, bounded, per-fact provenance) | ✅ Rust only; see [PAX_OBSERVATION.md](PAX_OBSERVATION.md) for what it does not observe | keep narrow; no relevance or impact semantics | PAX | — |
 | Declared vs. observed distinction | ⚠️ layers in `reality`; evidence `kind` in `drift`; not in `info`/`deps` | uniform `declared`/`observed` provenance per field | PAX | P1 |
 | Observation provenance (what, where, how) | ⚠️ file lists for components, graph, reality; none for diagnostics, manager version | per-field source references | PAX | P1 |
 | Observation time | ❌ none (and intentionally deterministic) | optional, separable from semantic fields | PAX | P2 |
