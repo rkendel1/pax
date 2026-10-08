@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1
+
+- fix `pax graph`: Cargo dependency edges are attributed to the declaring
+  package from `cargo metadata`, not the workspace-wide union (existing `info`
+  and `deps` output unchanged)
+- `observe`: refuse to read `mod x;` files through symlinks that leave the
+  project root (`artifact_outside_root`); reject empty scope values and
+  non-positive limits as `invalid_scope` / `invalid_limit`
+- record consumer-reported defects in `docs/PAX_AUDIT.md`; stop tracking
+  `target/` and `target-linux/`
+
 ## 0.4.0
 
 - add `pax observe` (`pax.observation.v1`): bounded, deterministic project-structure
