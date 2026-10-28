@@ -52,7 +52,7 @@ Inventory (all verified in code; "Det." = deterministic given identical files):
 | Tool selection for operations | yes | `resolve_operation`, `selection_ambiguity` (fail-closed) | plan / exit 2 | yes | none | many |
 | Dry-run plan | yes | `execution_plan` | plan JSON (no schema field) | yes | none | several |
 | Native delegation | yes | `dispatch_execution`, `Command::new(program)` | native stdio, exit code | no (native) | native tool | several |
-| Test result interpretation | yes (Cargo only) | `execution_result.rs` | `pax.execution-result.v1` | yes given same native result | `cargo` | 12 integration + 7 unit |
+| Test result interpretation | yes (Cargo; JavaScript for Vitest, Jest and `node --test` scripts) | `execution_result.rs` | `pax.execution-result.v1` | yes given same native result | `cargo` | 12 integration + 7 unit |
 | Timestamps / observer identity | runtime only | `--live` records `runtime.observedAt` (RFC 3339 UTC); static observation has no clock-derived fields | `runtime.observedAt` | — | — | `tests/runtime.rs`, `structured_output_is_versioned…` |
 
 Process execution in the whole crate: `Command::new` is used for `cargo
