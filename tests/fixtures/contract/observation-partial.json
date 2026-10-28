@@ -1,0 +1,41 @@
+{
+  "schema": "pax.observation.v1",
+  "status": "partial",
+  "outcome": "partial",
+  "project": {
+    "root": "/machine/project",
+    "name": "sample"
+  },
+  "scope": { "kind": "project" },
+  "observed_at": 1791469317,
+  "tool": { "name": "pax", "version": "0.5.0", "parser": "syn 2 (full)" },
+  "limits": { "max_files": 200, "max_bytes": 4194304, "max_facts": 5000 },
+  "cost": {
+    "entries_listed": 4,
+    "files_inspected": 2,
+    "files_parsed": 1,
+    "bytes_read": 512,
+    "facts": 1,
+    "elapsed_ms": 3
+  },
+  "facts": [
+    {
+      "relationship": "artifact.exists",
+      "subject": { "type": "artifact", "id": "pyproject.toml" },
+      "location": { "path": "pyproject.toml" },
+      "provenance": {
+        "strength": "observed",
+        "method": "fs.stat",
+        "source": "pyproject.toml"
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "source_structure_unsupported",
+      "state": "unsupported",
+      "message": "source structure parsing is not supported for python",
+      "location": { "path": "pyproject.toml" }
+    }
+  ]
+}

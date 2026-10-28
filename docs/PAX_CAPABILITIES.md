@@ -5,6 +5,11 @@ tested, ⚠️ partial or heuristic (see notes), ❌ not implemented. "Current" 
 what the code does, not what the README says. Details and evidence:
 [PAX_AUDIT.md](PAX_AUDIT.md). Boundary: [PAX_BOUNDARY.md](PAX_BOUNDARY.md).
 
+v0.5.0 note: the schema/versioning row below describes the v0.3.0 baseline.
+Canonical schema identifiers, typed outcomes, project-relative graph
+identities, and the compatibility policy are now defined in
+[PAX_CONTRACT.md](PAX_CONTRACT.md).
+
 ## Capabilities by owner
 
 | Capability | Current | Intended | Owner | Priority |

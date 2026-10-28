@@ -1,8 +1,37 @@
 use std::process::ExitCode;
 
+/// Returns the command word, skipping global option values. This prevents a
+/// script name or directory argument that happens to be `drift` from selecting
+/// drift exit-code semantics.
+fn command_word(args: &[String]) -> Option<&str> {
+    let mut skip_value = false;
+    let mut options = true;
+    for arg in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if options && arg == "--" {
+            options = false;
+            continue;
+        }
+        if options && arg.starts_with("--") {
+            if matches!(
+                arg.as_str(),
+                "--tool" | "--dir" | "--scope" | "--max-files" | "--max-bytes" | "--max-facts"
+            ) {
+                skip_value = true;
+            }
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
-    let drift = args.iter().any(|arg| arg == "drift");
+    let drift = command_word(&args) == Some("drift");
     let json = args.iter().any(|arg| arg == "--json");
     match pax::run(args) {
         Ok(output) => {

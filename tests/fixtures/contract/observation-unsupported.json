@@ -1,0 +1,15 @@
+{
+  "schema": "pax.observation.v1",
+  "status": "error",
+  "outcome": "unsupported",
+  "code": "unsupported_project",
+  "message": "no supported project structure found",
+  "cost": {
+    "entries_listed": 1,
+    "files_inspected": 0,
+    "files_parsed": 0,
+    "bytes_read": 0,
+    "facts": 0,
+    "elapsed_ms": 1
+  }
+}

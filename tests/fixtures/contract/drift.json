@@ -1,0 +1,21 @@
+{
+  "schema": "pax.drift.v1",
+  "schema_version": "1",
+  "outcome": "ok",
+  "command": "drift",
+  "live": false,
+  "status": "drift",
+  "issues": [
+    {
+      "subject": ".",
+      "status": "drift",
+      "expected": "pnpm",
+      "actual": "package-lock.json",
+      "evidence": [
+        { "source": "package-lock.json", "kind": "resolved" },
+        { "source": "package.json", "kind": "declared" }
+      ]
+    }
+  ],
+  "cargo": null
+}

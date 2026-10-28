@@ -166,6 +166,7 @@ fn missing_artifact_is_a_typed_error_not_an_empty_success() {
     let error = refusal(&root, &["--scope", "path:nope"]);
     assert_eq!(error["schema"], "pax.observation.v1");
     assert_eq!(error["status"], "error");
+    assert_eq!(error["outcome"], "failed");
     assert_eq!(error["code"], "scope_not_found");
     assert_eq!(
         refusal(&root, &["--scope", "file:src/nope.rs"])["code"],
@@ -664,6 +665,7 @@ fn exceeding_a_limit_is_an_explicit_error_never_a_truncation() {
     rust_project(&root);
     let files = refusal(&root, &["--max-files", "2"]);
     assert_eq!(files["code"], "limit_exceeded");
+    assert_eq!(files["outcome"], "blocked");
     assert_eq!(files["limit"], "max_files");
     assert_eq!(files["limit_value"], 2);
     assert!(files["cost"]["files_inspected"].as_u64().unwrap() <= 2);

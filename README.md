@@ -8,8 +8,9 @@ without trying to replace the underlying native tool. It does not resolve
 dependencies, manage environments or runtimes, or run workloads on its own.
 See [docs/PAX_BOUNDARY.md](docs/PAX_BOUNDARY.md) for what PAX claims and does
 not claim, [docs/PAX_CAPABILITIES.md](docs/PAX_CAPABILITIES.md) for the
-capability matrix, and [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md) for the evidence
-and known gaps.
+capability matrix, [docs/PAX_CONTRACT.md](docs/PAX_CONTRACT.md) for the JSON
+wire contract and compatibility policy, and [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md)
+for the evidence and known gaps.
 
 The inspection and observation commands (`info` through `drift`) are
 read-only. Delegated commands such as
@@ -143,8 +144,8 @@ provider, evidence, and canonical command without executing it.
 
 `pax --dry-run --json test` produces a structured **plan**: what PAX will
 execute. `pax --json test` produces a structured **execution result**: what
-happened when PAX executed it. They are different contracts; the plan has no
-`schema` or `status` field and its meaning is unchanged.
+happened when PAX executed it. They are different contracts. A plan declares
+`schema: "pax.plan.v1"` and has no `outcome` or `status` field.
 
 The execution result describes what PAX established about the delegated
 operation. It is not a general-purpose goal evaluator: whether a consumer's
@@ -235,14 +236,33 @@ the structural representation, including the operation, project root,
 workspace, selected tool, native command, environment additions, working
 directory, support status, evidence, and selection reason.
 
-JSON output carries a version (`schemaVersion` or `schema_version`, currently
-`"1"`) but no compatibility policy has been written for observation
-documents; only `pax.execution-result.v1` has a documented consumer contract. Observation statuses are
-`match`, `drift`, `ambiguous`, or `unknown`; unknown evidence is never promoted
-to drift. Exit code `0` means success/match, `1` means delegated failure or
-drift, and `2` means invalid input or ambiguity.
-JSON is intended for automation and agents; human-readable diagnostics are
-written separately and are never mixed into JSON output.
+## Observation contract
+
+Every JSON document carries a canonical `schema`
+(`pax.<subject>.v<major>`). Inspection and observation documents also carry a
+typed `outcome`: `ok`, `partial`, `unsupported`, `blocked`, `failed`, or
+`stale`. Only `ok` is success; `partial` and `unsupported` are explicitly not.
+
+Facts distinguish `present`, `absent`, `unknown`, `unsupported`, `blocked`,
+`failed`, and `stale`. Evidence names its source, method, and strength
+(`declared`, `observed`, `resolved`; observation never emits `verified`).
+Identities are project-relative: the root is `.`, paths use `/`, and absolute
+paths never become graph identities.
+
+The legacy numeric version (`schemaVersion` or `schema_version`, currently
+`"1"`) is retained for existing consumers. `pax.observation.v1` and
+`pax.execution-result.v1` keep their existing fields and semantics; new fields
+are additive. Drift keeps its subject-level `status` (`match`, `drift`,
+`ambiguous`, or `unsupported`) alongside `outcome`.
+
+See [docs/PAX_CONTRACT.md](docs/PAX_CONTRACT.md) for the full contract,
+compatibility policy, and intentional corrections.
+
+Exit code `0` means the command completed, `1` means delegated failure or
+drift, and `2` means invalid input or ambiguity. An exit code of `0` does not
+upgrade a `partial` or `unsupported` outcome. JSON is intended for automation
+and agents; human-readable diagnostics are written separately and are never
+mixed into JSON output.
 
 ## Installation
 

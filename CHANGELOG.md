@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0
+
+- add the canonical observation contract (`pax.contract.v1`): versioned
+  `schema` identifiers, typed `outcome` (`ok`, `partial`, `unsupported`,
+  `blocked`, `failed`, `stale`), distinct fact states, traceable evidence,
+  project-relative entity identities, and a compatibility policy; see
+  `docs/PAX_CONTRACT.md` and `src/contract.rs`
+- every inspection JSON document now carries `schema` and `outcome`; the legacy
+  `schemaVersion` / `schema_version` field remains `"1"` for compatibility
+- `pax observe` keeps `status` and adds `outcome`; unsupported-only observations
+  report `unsupported`, never `ok`
+- dry-run plans now declare `schema: "pax.plan.v1"` (documented correction)
+- graph identities are project-relative: the project root is `.`, workspace
+  roots are never absolute paths, and paths outside the root are opaque
+- a single-package Cargo project is no longer reported as a workspace by
+  `workspaces` or `graph`
+- `drift` reports `status`/`outcome` `unsupported` when there is nothing to
+  observe instead of claiming `match`
+- fix command-word parsing so `pax run drift` and `--dir drift` do not select
+  drift exit-code semantics
+- add contract fixtures and `tests/contract.rs`; update README and observation
+  docs
+
 ## 0.4.1
 
 - fix `pax graph`: Cargo dependency edges are attributed to the declaring

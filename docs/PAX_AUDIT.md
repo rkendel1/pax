@@ -11,6 +11,12 @@ marked as such. Companion documents: [PAX_BOUNDARY.md](PAX_BOUNDARY.md),
 `tests/boundary.rs` (`known_limitation_*` tests are tripwires for gaps recorded
 here).
 
+v0.5.0 update: the canonical schema/outcome contract in
+[PAX_CONTRACT.md](PAX_CONTRACT.md) and its documented corrections postdate this
+v0.3.0 audit. Statements below about missing schema policies, dry-run plans
+having no schema, and an empty project matching in `drift` describe the v0.3.0
+baseline, not current behavior.
+
 ## Executive conclusion
 
 PAX today is a file-reading project inspector with a thin delegation layer. It

@@ -1201,7 +1201,7 @@ fn dry_run_json_for_test_is_still_a_plan() {
     let root = temp_dir();
     write_cargo_project(&root, "pub fn value() {}\n");
     let value = result_json(&pax_in(&root, &["--json", "--dry-run", "test"]));
-    assert!(value.get("schema").is_none());
+    assert_eq!(value["schema"], "pax.plan.v1");
     assert!(value.get("status").is_none());
     assert_eq!(value["operation"], "test");
     assert_eq!(value["command"], serde_json::json!(["cargo", "test"]));

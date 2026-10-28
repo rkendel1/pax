@@ -6,8 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod contract;
 mod execution_result;
 mod observe;
+use contract::{LEGACY_SCHEMA_VERSION, Outcome, inspection_schema, project_relative_path};
 use execution_result::execute_with_result;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -212,7 +214,9 @@ struct PackageJsonData {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CommandOutput {
+    schema: &'static str,
     schema_version: &'static str,
+    outcome: Outcome,
     command: &'static str,
     project: ProjectInfo,
     manager: ManagerInfo,
@@ -310,7 +314,9 @@ struct GraphEvidence {
 
 #[derive(Clone, Debug, Serialize)]
 struct GraphOutput {
+    schema: &'static str,
     schema_version: &'static str,
+    outcome: Outcome,
     command: &'static str,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
@@ -333,7 +339,9 @@ struct RealityLayer {
 
 #[derive(Clone, Debug, Serialize)]
 struct RealityOutput {
+    schema: &'static str,
     schema_version: &'static str,
+    outcome: Outcome,
     command: &'static str,
     live: bool,
     declared: RealityLayer,
@@ -360,7 +368,9 @@ struct DriftEvidence {
 
 #[derive(Clone, Debug, Serialize)]
 struct DriftOutput {
+    schema: &'static str,
     schema_version: &'static str,
+    outcome: Outcome,
     command: &'static str,
     live: bool,
     status: String,
@@ -448,6 +458,7 @@ struct ResolvedOperation {
 
 #[derive(Clone, Debug, Serialize)]
 struct ExecutionPlan {
+    schema: &'static str,
     operation: String,
     ecosystem: String,
     tool: String,
@@ -823,7 +834,9 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
             });
         }
     }
-    if let Some(cargo) = &detection.cargo {
+    if let Some(cargo) = &detection.cargo
+        && cargo.workspace
+    {
         for member in &cargo.workspace_members {
             nodes.push(GraphNode {
                 id: member.clone(),
@@ -852,7 +865,13 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
     edges.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
     evidence.sort_by(|a, b| a.edge.cmp(&b.edge));
     GraphOutput {
-        schema_version: "1",
+        schema: contract::GRAPH_SCHEMA,
+        schema_version: LEGACY_SCHEMA_VERSION,
+        outcome: if nodes.is_empty() {
+            Outcome::Unsupported
+        } else {
+            Outcome::Ok
+        },
         command: "graph",
         nodes,
         edges,
@@ -862,7 +881,7 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
 }
 
 fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
-    let declared = detection
+    let declared: Vec<RealityObservation> = detection
         .components
         .iter()
         .map(|component| RealityObservation {
@@ -882,7 +901,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
                 .collect(),
         })
         .collect();
-    let resolved = detection
+    let resolved: Vec<RealityObservation> = detection
         .components
         .iter()
         .flat_map(|component| {
@@ -898,7 +917,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
             })
         })
         .collect();
-    let installed = detection
+    let installed: Vec<RealityObservation> = detection
         .components
         .iter()
         .map(|component| {
@@ -937,7 +956,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
             }
         })
         .collect();
-    let runtime = if live {
+    let runtime: Vec<RealityObservation> = if live {
         detection
             .components
             .iter()
@@ -952,8 +971,23 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
     } else {
         Vec::new()
     };
+    let unsupported = detection.components.is_empty();
+    let partial = declared
+        .iter()
+        .chain(resolved.iter())
+        .chain(installed.iter())
+        .chain(runtime.iter())
+        .any(|observation| observation.status == "unknown");
     RealityOutput {
-        schema_version: "1",
+        schema: contract::REALITY_SCHEMA,
+        schema_version: LEGACY_SCHEMA_VERSION,
+        outcome: if unsupported {
+            Outcome::Unsupported
+        } else if partial {
+            Outcome::Partial
+        } else {
+            Outcome::Ok
+        },
         command: "reality",
         live,
         declared: RealityLayer {
@@ -1122,11 +1156,23 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
         }
     }
     issues.sort_by(|a, b| a.subject.cmp(&b.subject).then(a.status.cmp(&b.status)));
+    let unsupported = detection.components.is_empty();
+    let partial = issues.iter().any(|issue| issue.status == "unknown");
     DriftOutput {
-        schema_version: "1",
+        schema: contract::DRIFT_SCHEMA,
+        schema_version: LEGACY_SCHEMA_VERSION,
+        outcome: if unsupported {
+            Outcome::Unsupported
+        } else if partial {
+            Outcome::Partial
+        } else {
+            Outcome::Ok
+        },
         command: "drift",
         live,
-        status: if issues.iter().any(|issue| issue.status == "drift") {
+        status: if unsupported {
+            "unsupported".to_string()
+        } else if issues.iter().any(|issue| issue.status == "drift") {
             "drift".to_string()
         } else if issues.is_empty() {
             "match".to_string()
@@ -2101,6 +2147,7 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
         }
     }
     ExecutionPlan {
+        schema: contract::PLAN_SCHEMA,
         operation: operation.to_string(),
         ecosystem: if tool == "cargo" {
             "rust"
@@ -2365,7 +2412,9 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
             .iter_mut()
             .find(|component| component.ecosystem == Ecosystem::Rust && component.path == ".")
         {
-            component.workspace_packages = cargo.workspace_members.clone();
+            if cargo.workspace {
+                component.workspace_packages = cargo.workspace_members.clone();
+            }
             component.lockfiles = cargo.lockfile.iter().cloned().collect();
             component.evidence.retain(|item| item.kind != "lockfile");
             component
@@ -2401,12 +2450,16 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
 }
 
 fn display_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .ok()
-        .and_then(|path| path.to_str())
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| path.to_str().unwrap_or("."))
-        .to_string()
+    if let Ok(relative) = path.strip_prefix(root) {
+        return project_relative_path(&relative.to_string_lossy())
+            .unwrap_or_else(|_| ".".to_string());
+    }
+    // A path outside the project root must never become a machine-specific
+    // absolute identity. Keep an opaque, stable suffix instead.
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("external/{name}"))
+        .unwrap_or_else(|| "external/unknown".to_string())
 }
 
 fn detect_cargo(root: &Path) -> Option<CargoObservation> {
@@ -3187,12 +3240,74 @@ fn manager_from_lockfile(lockfile: &str) -> Option<PackageManager> {
     }
 }
 
+fn inspection_outcome(
+    command: &str,
+    detection: &RepositoryDetection,
+    diagnostics: &[Diagnostic],
+) -> Outcome {
+    let has_any =
+        !detection.components.is_empty() || detection.package_json || detection.cargo.is_some();
+    if !has_any {
+        return Outcome::Unsupported;
+    }
+
+    let any_javascript = detection
+        .components
+        .iter()
+        .any(|component| component.ecosystem == Ecosystem::JavaScript);
+    let any_javascript_or_rust = detection
+        .components
+        .iter()
+        .any(|component| matches!(component.ecosystem, Ecosystem::JavaScript | Ecosystem::Rust));
+    let any_python = detection
+        .components
+        .iter()
+        .any(|component| component.ecosystem == Ecosystem::Python);
+    let python_lockfiles = detection.components.iter().any(|component| {
+        component.ecosystem == Ecosystem::Python && !component.lockfiles.is_empty()
+    });
+    let only_container = !detection.components.is_empty()
+        && detection
+            .components
+            .iter()
+            .all(|component| component.ecosystem == Ecosystem::Container);
+
+    let command_outcome = match command {
+        // Scripts are only observed for JavaScript manifests.
+        "scripts" if !any_javascript => Some(Outcome::Unsupported),
+        "scripts" if detection.components.len() > 1 => Some(Outcome::Partial),
+        // Python dependency parsing is explicitly incomplete; do not call it ok.
+        "deps" if only_container => Some(Outcome::Unsupported),
+        "deps" if any_python => Some(Outcome::Partial),
+        // Python workspace membership is not observed.
+        "workspaces" if !any_javascript_or_rust => Some(Outcome::Unsupported),
+        "workspaces" if any_python => Some(Outcome::Partial),
+        // Python lockfiles are detected but are not part of the lock document yet.
+        "lock" if !any_javascript_or_rust && !any_python => Some(Outcome::Unsupported),
+        "lock" if python_lockfiles => Some(Outcome::Partial),
+        _ => None,
+    };
+    if let Some(outcome) = command_outcome {
+        return outcome;
+    }
+
+    if diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic.level, DiagnosticLevel::Error))
+    {
+        Outcome::Partial
+    } else {
+        Outcome::Ok
+    }
+}
+
 fn build_output(
     command: &'static str,
     detection: RepositoryDetection,
     include_runtime: bool,
 ) -> CommandOutput {
     let diagnostics = build_diagnostics(&detection);
+    let outcome = inspection_outcome(command, &detection, &diagnostics);
     let runtime = if include_runtime {
         detect_node_runtime()
     } else {
@@ -3236,7 +3351,9 @@ fn build_output(
     };
 
     CommandOutput {
-        schema_version: "1",
+        schema: inspection_schema(command),
+        schema_version: LEGACY_SCHEMA_VERSION,
+        outcome,
         command,
         project: ProjectInfo {
             root: detection.root.display().to_string(),
@@ -3349,6 +3466,7 @@ fn build_output(
                     detection
                         .cargo
                         .iter()
+                        .filter(|cargo| cargo.workspace)
                         .flat_map(|cargo| cargo.workspace_members.iter().cloned()),
                 )
                 .chain(

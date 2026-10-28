@@ -122,13 +122,15 @@ fn structured_output_is_versioned_and_deterministic() {
         let first = json(&root, &["--json", command]);
         let second = json(&root, &["--json", command]);
         assert_eq!(first, second, "{command} is not deterministic");
-        // The version key is `schemaVersion` for inspection documents and
-        // `schema_version` for graph/reality/drift (audit: inconsistent casing).
+        // The canonical key is `schema`; the legacy `schemaVersion` /
+        // `schema_version` numeric field is retained for compatibility.
         let version = first
             .get("schemaVersion")
             .or_else(|| first.get("schema_version"))
             .unwrap_or_else(|| panic!("{command} has no schema version"));
         assert_eq!(version, "1");
+        assert_eq!(first["schema"], format!("pax.{command}.v1"));
+        assert!(first["outcome"].is_string());
         assert_eq!(first["command"], command);
         // No clock-derived fields exist anywhere in observation output.
         let text = first.to_string();

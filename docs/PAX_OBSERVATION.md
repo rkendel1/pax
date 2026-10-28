@@ -75,6 +75,7 @@ and refused under the default bounds. Narrow scopes are the intended use.
 {
   "schema": "pax.observation.v1",
   "status": "ok" | "partial",          // partial = at least one diagnostic
+  "outcome": "ok" | "partial" | "unsupported", // canonical; only ok is success
   "project": { "root": "...", "name": "..." },
   "scope":   { "kind": "module", "value": "pax/lib::crate::a" },
   "observed_at": 1791469317,           // unix seconds
@@ -94,8 +95,9 @@ and refused under the default bounds. Narrow scopes are the intended use.
 }
 ```
 
-Errors are one JSON document with `"status": "error"`, a `code`, and for limits
-`limit`, `limit_value`, and `cost`. They exit with code 2 and, like other PAX
+Errors are one JSON document with `"status": "error"`, a canonical `outcome`
+(`unsupported`, `blocked`, or `failed`), a `code`, and for limits `limit`,
+`limit_value`, and `cost`. They exit with code 2 and, like other PAX
 errors, go to stderr. Without `--json`, errors are `error[code]: message` and
 facts are one line each.
 
@@ -159,6 +161,11 @@ commands it starts `cargo metadata --no-deps --offline` for Cargo projects (not
 for `file:` and `path:` scopes). It is covered by the read-only test in
 `tests/boundary.rs`. Two new dependencies are used for parsing: `syn` (already in
 `Cargo.lock` via `serde_derive`) and `proc-macro2` (line numbers).
+
+v0.5.0 adds the canonical `outcome` field without changing `status` or any
+existing field. An observation that establishes no facts and emits only
+`unsupported` diagnostics has `status: "partial"` but `outcome: "unsupported"`.
+See [PAX_CONTRACT.md](PAX_CONTRACT.md).
 
 `observed_at` and `cost.elapsed_ms` are the only nondeterministic fields; the
 rest is stable for unchanged inputs.

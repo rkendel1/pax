@@ -1,0 +1,15 @@
+{
+  "schema": "pax.plan.v1",
+  "operation": "test",
+  "ecosystem": "rust",
+  "tool": "cargo",
+  "runner": "cargo",
+  "command": ["cargo", "test"],
+  "evidence": ["Cargo.toml"],
+  "working_directory": "/machine/project",
+  "project_root": "/machine/project",
+  "workspace": null,
+  "environment": {},
+  "supported": true,
+  "selection_reason": "Cargo.toml selects Cargo"
+}

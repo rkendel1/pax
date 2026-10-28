@@ -1,0 +1,17 @@
+{
+  "schema": "pax.graph.v1",
+  "schema_version": "1",
+  "outcome": "ok",
+  "command": "graph",
+  "nodes": [
+    { "id": ".", "kind": "component", "ecosystem": "javascript" },
+    { "id": "react", "kind": "dependency", "ecosystem": "javascript" }
+  ],
+  "edges": [
+    { "from": ".", "to": "react", "kind": "runtime-dependency" }
+  ],
+  "evidence": [
+    { "edge": ". -> react", "evidence": ["package.json"] }
+  ],
+  "cargo": null
+}

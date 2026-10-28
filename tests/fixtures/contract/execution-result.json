@@ -1,0 +1,9 @@
+{
+  "schema": "pax.execution-result.v1",
+  "operation": "test",
+  "status": "unsupported",
+  "reason": "interpretation-unsupported",
+  "tool": "npm",
+  "exit_code": 0,
+  "tests": null
+}

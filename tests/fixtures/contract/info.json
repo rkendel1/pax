@@ -1,0 +1,55 @@
+{
+  "schema": "pax.info.v1",
+  "schemaVersion": "1",
+  "outcome": "ok",
+  "command": "info",
+  "project": {
+    "root": "/machine/project",
+    "name": "sample",
+    "packageJson": true,
+    "workspace": false,
+    "workspaceSource": null
+  },
+  "manager": {
+    "name": "pnpm",
+    "version": "10.15.0",
+    "lockfile": "pnpm-lock.yaml",
+    "selectedBy": "package.json#packageManager"
+  },
+  "result": {
+    "summary": "Detected pnpm package reality for sample",
+    "runtime": null
+  },
+  "diagnostics": [
+    {
+      "level": "ok",
+      "check": "package.json",
+      "message": "package.json found"
+    }
+  ],
+  "evidence": {
+    "packageManagerField": "pnpm@10.15.0",
+    "lockfiles": ["pnpm-lock.yaml"],
+    "workspaceFiles": [],
+    "selectionNotes": []
+  },
+  "ecosystem": "javascript",
+  "components": [
+    {
+      "path": ".",
+      "ecosystem": "javascript",
+      "tool": "pnpm",
+      "manifests": ["package.json"],
+      "lockfiles": ["pnpm-lock.yaml"],
+      "evidence": [
+        { "kind": "manifest", "path": "package.json" },
+        { "kind": "lockfile", "path": "pnpm-lock.yaml" }
+      ],
+      "workspacePackages": [],
+      "dependencySources": [{ "kind": "lockfile", "path": "pnpm-lock.yaml" }]
+    }
+  ],
+  "nativeDependencies": [],
+  "container": null,
+  "cargo": null
+}

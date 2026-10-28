@@ -1,0 +1,39 @@
+{
+  "schema": "pax.reality.v1",
+  "schema_version": "1",
+  "outcome": "partial",
+  "command": "reality",
+  "live": false,
+  "declared": {
+    "observations": [
+      {
+        "subject": ".",
+        "status": "present",
+        "source": "filesystem",
+        "evidence": ["package.json"]
+      }
+    ]
+  },
+  "resolved": {
+    "observations": [
+      {
+        "subject": ".",
+        "status": "present",
+        "source": "filesystem",
+        "evidence": ["pnpm-lock.yaml"]
+      }
+    ]
+  },
+  "installed": {
+    "observations": [
+      {
+        "subject": ".",
+        "status": "absent",
+        "source": "filesystem",
+        "evidence": ["node_modules/"]
+      }
+    ]
+  },
+  "runtime": { "observations": [] },
+  "cargo": null
+}

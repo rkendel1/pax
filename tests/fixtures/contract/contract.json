@@ -1,0 +1,19 @@
+{
+  "schema": "pax.contract.v1",
+  "outcomes": ["ok", "partial", "unsupported", "blocked", "failed", "stale"],
+  "fact_states": [
+    "present",
+    "absent",
+    "unknown",
+    "unsupported",
+    "blocked",
+    "failed",
+    "stale"
+  ],
+  "evidence_strengths": ["declared", "observed", "resolved", "verified"],
+  "identity": {
+    "root": ".",
+    "separator": "/",
+    "forbidden": ["absolute paths", "drive prefixes", "parent traversal"]
+  }
+}

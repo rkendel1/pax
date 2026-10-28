@@ -8,9 +8,10 @@
 //!
 //! Schema: `pax.observation.v1`. See docs/PAX_OBSERVATION.md.
 
+use super::contract::{Entity, EvidenceStrength, Outcome};
 use super::{CargoObservation, CliError, detect_cargo};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -61,30 +62,6 @@ struct Cost {
     elapsed_ms: u128,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct Entity {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    id: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    attributes: BTreeMap<&'static str, String>,
-}
-
-impl Entity {
-    fn new(kind: &'static str, id: impl Into<String>) -> Self {
-        Entity {
-            kind,
-            id: id.into(),
-            attributes: BTreeMap::new(),
-        }
-    }
-
-    fn with(mut self, key: &'static str, value: impl Into<String>) -> Self {
-        self.attributes.insert(key, value.into());
-        self
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct Location {
     path: String,
@@ -106,29 +83,10 @@ fn at_file(path: &str) -> Option<Location> {
     })
 }
 
-/// How strongly a fact is established. `verified` is deliberately absent: observation
-/// never executes anything, so it can never establish a verified fact. Strength is
-/// never upgraded without evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Strength {
-    /// A project artifact states the relationship; nothing checked it.
-    Declared,
-    /// PAX read the artifact on this machine at observation time.
-    Observed,
-    /// A resolver (Cargo) established the relationship.
-    Resolved,
-}
-
-impl Strength {
-    fn as_str(self) -> &'static str {
-        match self {
-            Strength::Declared => "declared",
-            Strength::Observed => "observed",
-            Strength::Resolved => "resolved",
-        }
-    }
-}
+/// How strongly a fact is established. `verified` is deliberately absent from
+/// observation output: observation never executes anything, so it can never
+/// establish a verified fact. Strength is never upgraded without evidence.
+type Strength = EvidenceStrength;
 
 #[derive(Debug, Serialize)]
 struct Provenance {
@@ -191,6 +149,7 @@ struct ToolOutput {
 struct Observation {
     schema: &'static str,
     status: &'static str,
+    outcome: Outcome,
     project: ProjectOutput,
     scope: ScopeOutput,
     observed_at: u64,
@@ -206,6 +165,7 @@ struct Observation {
 struct ObservationError {
     schema: &'static str,
     status: &'static str,
+    outcome: Outcome,
     code: &'static str,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,12 +182,23 @@ fn refuse(code: &'static str, message: impl Into<String>) -> Box<ObservationErro
     Box::new(ObservationError {
         schema: SCHEMA,
         status: "error",
+        outcome: outcome_for_error_code(code),
         code,
         message: message.into(),
         limit: None,
         limit_value: None,
         cost: None,
     })
+}
+
+/// Maps the legacy observation error codes onto the canonical outcome taxonomy.
+/// An unsupported request is never reported as a successful outcome.
+fn outcome_for_error_code(code: &str) -> Outcome {
+    match code {
+        "unsupported_project" | "unsupported_scope" => Outcome::Unsupported,
+        "limit_exceeded" => Outcome::Blocked,
+        _ => Outcome::Failed,
+    }
 }
 
 enum Scope {
@@ -435,6 +406,7 @@ impl<'a> Obs<'a> {
         Box::new(ObservationError {
             schema: SCHEMA,
             status: "error",
+            outcome: Outcome::Blocked,
             code: "limit_exceeded",
             message: format!(
                 "scope exceeds {limit} ({value}) while {what}; narrow the scope or raise --{}",
@@ -1403,6 +1375,22 @@ fn run_scope(
     }
 }
 
+fn observation_outcome(obs: &Obs<'_>) -> Outcome {
+    if obs.diagnostics.is_empty() {
+        return Outcome::Ok;
+    }
+    let established_nothing = obs.facts.is_empty();
+    let only_unsupported = obs
+        .diagnostics
+        .iter()
+        .all(|diagnostic| matches!(diagnostic.state, DiagnosticState::Unsupported));
+    if established_nothing && only_unsupported {
+        Outcome::Unsupported
+    } else {
+        Outcome::Partial
+    }
+}
+
 pub fn observe(root: &Path, options: &ObserveOptions, json: bool) -> Result<String, CliError> {
     let mut obs_slot: Option<Obs> = None;
     let result = (|| -> Observed<Observation> {
@@ -1411,10 +1399,12 @@ pub fn observe(root: &Path, options: &ObserveOptions, json: bool) -> Result<Stri
         let obs = obs_slot.insert(Obs::new(root, limits));
         let mut cargo = None;
         run_scope(obs, root, &scope, &mut cargo)?;
+        let outcome = observation_outcome(obs);
         let partial = !obs.diagnostics.is_empty();
         Ok(Observation {
             schema: SCHEMA,
             status: if partial { "partial" } else { "ok" },
+            outcome,
             project: ProjectOutput {
                 root: root.display().to_string(),
                 name: project_name(root, cargo.as_ref()),
