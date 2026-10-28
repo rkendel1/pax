@@ -1280,7 +1280,7 @@ fn run_scope(
 ) -> Observed<()> {
     match scope {
         Scope::Project => {
-            let cargo = detect_cargo(root);
+            let cargo = detect_cargo(root, &mut Vec::new());
             let result = observe_project(obs, cargo.as_ref());
             *cargo_out = cargo;
             result
@@ -1291,7 +1291,7 @@ fn run_scope(
                 Scope::Module { crate_id, chain } => (crate_id, chain),
                 _ => unreachable!(),
             };
-            let cargo = detect_cargo(root).ok_or_else(|| {
+            let cargo = detect_cargo(root, &mut Vec::new()).ok_or_else(|| {
                 refuse(
                     "unsupported_project",
                     "crate and module scopes require a Cargo project (no Cargo.toml at the project root)",

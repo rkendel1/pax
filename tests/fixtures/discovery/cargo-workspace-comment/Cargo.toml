@@ -1,0 +1,6 @@
+[workspace] # root workspace
+members = [
+  "crates/app", # application crate
+  "crates/lib",
+]
+resolver = "2"

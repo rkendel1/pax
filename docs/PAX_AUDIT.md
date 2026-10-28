@@ -22,13 +22,13 @@ baseline, not current behavior.
 PAX today is a file-reading project inspector with a thin delegation layer. It
 detects JavaScript, Python, Rust, and container projects from manifests and
 lockfiles, reports declared dependencies and scripts (accurately for
-`package.json` and Cargo, unreliably for Python and Compose), checks whether a
-few conventional directories exist, selects a native tool deterministically, and
-can run that tool and, for Cargo tests, state what the result means. It does
-not resolve dependencies, probe the host, run workloads on its own authority,
-or know anything about runtime versions. Its `reality` vocabulary describes
-presence checks, not verified reality, and two behaviors (`--live`, the
-`runtime` field) claim more than they do.
+`package.json`, Cargo, Python TOML/requirements/Pipfile, and Compose services),
+checks whether a few conventional directories exist, selects a native tool
+deterministically, and can run that tool and, for Cargo tests, state what the
+result means. It does not resolve dependencies, probe the host, run workloads on
+its own authority, or know anything about runtime versions. Its `reality`
+vocabulary describes presence checks, not verified reality, and the `--live`
+`runtime` field claims more than it does.
 
 ## What PAX actually does
 
@@ -39,9 +39,9 @@ Inventory (all verified in code; "Det." = deterministic given identical files):
 | Project discovery | yes | `collect_project_dirs`, `detect_components` (recurses dirs not starting with `.`, skipping `target`, `node_modules`) | `components[]` | yes | none | `info_json_detects_python_rust_and_docker_components` |
 | JS manifest parse | yes | `read_package_json` (serde_json; errors are explicit, exit 1) | `deps`, `scripts`, `workspaces` | yes | none | several |
 | JS manager selection | yes | `select_manager`, `manager_from_lockfile` | `manager`, `evidence.selectionNotes` | yes | none | `package_manager_field_wins…`, `lockfile_precedence…` |
-| Python detection/parse | partial | `detect_python_component`: line scanner, not a TOML parser | `components[]`, `nativeDependencies[]` | yes | none | detection only; parser is wrong (below) |
-| Rust via Cargo | yes | `detect_cargo`: `cargo metadata --no-deps --offline`; else line-scan fallback with `source: "Cargo.toml fallback"` | `cargo{}`, `nativeDependencies[]` | yes | `cargo` on PATH | `cargo_workspace_*` tests |
-| Container detection/parse | partial | `detect_container_component`: line scanner | `container{}` | yes | none | detection only |
+| Python detection/parse | yes (pipenv: discovery only) | `detect_python_component` parses TOML (`[project]`, optional groups, `[dependency-groups]`, Poetry, `[build-system].requires`), standalone and nested requirements files, and Pipfile | `components[]`, `nativeDependencies[]` | yes | none | `tests/discovery.rs` |
+| Rust via Cargo | yes | `detect_cargo`: `cargo metadata --no-deps --offline`; else TOML fallback with `source: "Cargo.toml fallback"` | `cargo{}`, `nativeDependencies[]` | yes | `cargo` on PATH | `cargo_workspace_*` tests |
+| Container detection/parse | yes | `detect_container_component`; Dockerfile line scanner, Compose services limited to direct children of `services:` | `container{}` | yes | none | `tests/discovery.rs` |
 | Dependency graph | yes (declared edges only) | `build_graph` | `nodes`, `edges`, `evidence` | yes (sorted) | none | `graph_json_preserves…` |
 | "Reality" layers | partial | `build_reality` (field table below) | 4 layers | yes | none | `reality_json_is_static…` |
 | Drift | partial | `build_drift`; lockfile check is `contents.contains(name)` | `status`, `issues[]` | yes | none | `drift_json_reports_conflicts…` |
@@ -68,9 +68,10 @@ Directly, at invocation time, with no timestamp recorded:
   `Pipfile.lock`, `Cargo.toml`, `Cargo.lock`, `Dockerfile*`, compose files;
 - existence of directories: `node_modules`, `target`, `.venv`/`venv`/`.env`;
 - contents of `package.json` (name, `packageManager`, dependency maps, scripts,
-  workspaces);
-- text lines of `pyproject.toml`, `requirements*.txt`, `Cargo.toml` (fallback),
-  Dockerfiles, compose files (heuristic);
+  workspaces) for every `package.json` in the project, including nested ones;
+- TOML of `pyproject.toml`, `Pipfile`, and `Cargo.toml` (fallback), requirement
+  lines of `requirements*.txt` and `requirements/*.txt`, Dockerfiles, and
+  compose files (direct children of `services:`);
 - Cargo's own metadata (packages, members, declared dependencies, lockfile
   path) via `cargo metadata`.
 
@@ -158,33 +159,46 @@ dependencies.
 | `ecosystem` | component ecosystems | PAX | derived | yes | via `components` | project-local |
 | `manager.name/version/lockfile/selectedBy` | `packageManager` field / lockfile | project | declared (field) or inferred (lockfile) | yes | `evidence.*` | project-local |
 | `components[]` | manifests, lockfiles | filesystem | detected | yes | `evidence[]` | project-local |
-| `dependencies.*` (JS) | package.json | project | declared | yes | no per-item path | project-local |
-| `nativeDependencies[]` | Cargo metadata (accurate) / line scanners (Python, fallback Cargo) | mixed | declared (Cargo) / **misparsed (Python)** | yes | no | project-local |
+| `dependencies.*` (JS) | package.json at the project root | project | declared | yes | `source` on native dependencies; root groups are implicit | project-local |
+| `nativeDependencies[]` | Cargo metadata / Python TOML, requirements, Pipfile / fallback Cargo / nested package.json | project | declared; each item names its `source` manifest or requirements file | yes | `source` | project-local |
 | `scripts` | package.json | project | declared | yes | no | project-local |
-| `container.*` | Dockerfile/compose lines | project | heuristic | yes | no | project-local |
+| `container.*` | Dockerfile/compose files | project | declared from direct `services:` children; Dockerfile directives are line-scanned | yes | no | project-local |
 | `diagnostics[]` | PAX checks | PAX | derived | yes | message only | project-local |
 | `result.runtime` | `detect_node_runtime()` | — | always `null` | — | — | — |
 
-## Parsers that do not match their claims (verified by running the binary)
+## Parser corrections in 0.5.0
 
-1. **Python `pyproject.toml`**: every `key = "string"` line becomes a
-   "dependency". For `name`, `version`, `requires-python`, `dependencies`, PAX
-   reports four dependencies named exactly that. The actual dependency
-   (`requests>=2`) is not extracted. `requires-python` (a runtime requirement)
-   is reported as a dependency.
-2. **`requirements.txt` alone**: no dependencies reported. The loop that reads
-   requirements files is nested inside the `pyproject.toml` line loop.
-3. **Compose**: any `word:` line without spaces becomes a service, so `ports`,
-   `environment`, `build` are reported next to `web`.
-4. **Malformed manifests**: a broken `pyproject.toml` yields `ecosystem:
-   python` and no diagnostic. A broken `Cargo.toml` falls back to a line
-   scanner (`source` says so, but diagnostics still say "Cargo.toml found").
-   Only an unparsable `package.json` is an explicit error.
-5. **Diagnostics are JavaScript-centric**: a Python-only or empty directory
-   reports `error: package.json is required to inspect a JavaScript package`.
-6. **Declared runtime requirements are ignored**: `engines.node`,
-   `requires-python`, `rust-version`, `.nvmrc`, `.tool-versions`,
-   `rust-toolchain` are not read, so none appears in any output.
+The v0.3.0 findings below were fixed and are pinned by `tests/discovery.rs`:
+
+1. **Python `pyproject.toml`** is parsed as TOML. `[project].dependencies`,
+   `[project.optional-dependencies]`, `[dependency-groups]`,
+   `[tool.poetry]` dependencies/groups, and `[build-system].requires` are read;
+   project metadata such as `name` and `version` is not a dependency.
+2. **`requirements*.txt`** is discovered independently of `pyproject.toml`,
+   including top-level variants and `requirements/*.txt`. Requirement lines,
+   extras, environment markers, comments, and line continuations are
+   interpreted; pip options are skipped and URL requirements are reported as
+   uninterpreted.
+3. **`Pipfile`** declarations are read from `[packages]` and `[dev-packages]`,
+   and the project tool is reported as `pipenv`. Pipenv execution is
+   unsupported and fails with an explicit error.
+4. **Compose** services are limited to direct children of `services:`;
+   `ports`, `environment`, `build`, and other nested keys are not services.
+   Images are collected from service definitions.
+5. **Malformed manifests** produce Error diagnostics instead of silent or
+   invented observations: broken `pyproject.toml`, `Pipfile`, `Cargo.toml`, and
+   nested `package.json` files make the inspection outcome `partial`. A broken
+   root `package.json` remains an explicit exit-1 error. Malformed requirement
+   lines produce Warning diagnostics.
+6. **Diagnostics are no longer JavaScript-centric**: JavaScript-specific
+   checks are emitted only when `package.json` exists; Python-only projects
+   report their own manifest and lockfile diagnostics.
+7. **Ambiguous Python manifests**: a project with both `pyproject.toml` and
+   `Pipfile` reports a Warning and interprets `pyproject.toml`.
+
+Remaining limitations: declared runtime requirements (`engines.node`,
+`requires-python`, `rust-version`, `.nvmrc`, `.tool-versions`,
+`rust-toolchain`) are still not read, and pipenv cannot be executed.
 
 ## JSON contract audit
 
@@ -195,9 +209,9 @@ dependencies.
 | Required / optional fields | Not specified. `skip_serializing_if` omits `dependencies`, `scripts`, `workspaces`, `lock`, `cargo` by command; other `Option`s serialize as `null`. |
 | Unknown fields | Consumers (Compute) ignore them; nothing tells consumers they may appear. |
 | Error representation | Observation commands: human message on stderr, exit 1 or 2, empty stdout. Only `--json test` returns a structured error. |
-| Provenance | File lists in `components`, `graph`, `reality`, `drift`; absent from `deps`, `scripts`, `manager.version`, diagnostics. |
+| Provenance | File lists in `components`, `graph`, `reality`, `drift`; native dependencies name their manifest/requirements `source`; diagnostics name a check and message. See [PAX_CONTRACT.md](PAX_CONTRACT.md) for canonical evidence. |
 | Timestamps | None, anywhere. Deterministic: verified by running each command twice (`structured_output_is_versioned_and_deterministic`). |
-| Source information | `cargo.source` names the Cargo method; nothing else names its method. |
+| Source information | `cargo.source` names the Cargo method; native dependencies name their declaring manifest or requirements file; `components[].evidence[]` and graph/reality/drift evidence name files. |
 | Ordering | Graph, drift, dependencies, components are sorted; JSON object key order follows Rust struct order. |
 | Stable identifiers | None. `project.name` can be a directory name; `project.root` is machine-specific. |
 
@@ -231,7 +245,7 @@ pax info/deps/scripts ──▶ PaxObservation::from_documents (validate)
 | `ecosystem` | `javascript`→Node, `python`→Python, anything else (Rust, container, mixed `null`) ⇒ `unresolved` | single ecosystem | — |
 | `manager.name/version` | provisioning tool (never run by Compute) | declared, not verified on target | `selectedBy`, `lockfile`, `evidence`, `selectionNotes` |
 | `dependencies.{dependencies,devDependencies,optionalDependencies,peerDependencies}` | dependency needs | declared specifiers | — |
-| `dependencies.nativeDependencies` | non-empty ⇒ `unresolved` | PAX reports Python only this way | content (they are not even correct for Python) |
+| `dependencies.nativeDependencies` | non-empty ⇒ `unresolved` | PAX reports non-JavaScript declarations here, each with its `source` | content (Compute does not normalize native declarations) |
 | `scripts.scripts` | commands | declared | — |
 
 What Compute discards that matters:
@@ -280,8 +294,8 @@ declared and inferred values without marking which is which.
 | README | "`pax info` reports detected package-manager reality" | reports selection from a field/lockfile |
 | README | "runtime inspection is opt-in with `--live`" | `--live` inspects nothing |
 | README | "`pax reality` separates declared, resolved, installed, and runtime observations" | presence checks; runtime layer has no observations |
-| README | "Cargo projects use … `cargo metadata --no-deps` for authoritative workspace semantics" | true when cargo succeeds; heuristic fallback otherwise |
-| README | "native dependency semantics, and static container services" | Python deps misparsed; Compose services over-reported |
+| README | "Cargo projects use … `cargo metadata --no-deps` for authoritative workspace semantics" | true when cargo succeeds; TOML fallback otherwise (provenance names the fallback) |
+| README | "native dependency semantics, and static container services" | accurate for Python TOML, requirements, Pipfile, nested `package.json`, and direct Compose services; unknown constructs are diagnosed |
 | README | "`pax drift` reports contradictions between those layers" | partly substring checks; `unknown` surfaces as `ambiguous` |
 | README | "unknown evidence is never promoted to drift" | true, but promoted to `ambiguous` |
 | `info.result.summary` | "Detected … package reality" | string constant, see above |
@@ -309,11 +323,12 @@ whose identifiers must not be joined across edge kinds without inspecting them.
 
 1. **P0** Stop `--live` and `runtime` from implying observation (remove the
    claim, or implement a real observation with a recorded command and result).
-2. **P0** Fix or fence the Python parser (real TOML parse, or report
-   "not interpreted"); read `requirements.txt` independently of
-   `pyproject.toml`.
-3. **P1** Add explicit unparseable/unknown diagnostics for every manifest PAX
-   reads; remove JavaScript-only diagnostics from non-JS projects.
+2. **P0** ~~Fix or fence the Python parser~~ Fixed in 0.5.0: real TOML parse,
+   independent `requirements*.txt` discovery, Pipfile declarations, and
+   explicit `partial` outcomes for malformed manifests.
+3. **P1** ~~Add explicit unparseable/unknown diagnostics for every manifest PAX
+   reads; remove JavaScript-only diagnostics from non-JS projects.~~ Fixed in
+   0.5.0 (`detection_diagnostics`; JS checks only when `package.json` exists).
 4. **P1** Report declared runtime requirements as declared observations
    (`engines`, `requires-python`, `rust-version`, `.nvmrc`), with source file.
 5. **P1** One schema/versioning convention and a written compatibility policy

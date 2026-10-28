@@ -292,20 +292,24 @@ fn invalid_package_json_is_an_explicit_error() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("failed to parse"));
 }
 
-// 4 + 10 (negative): malformed non-JSON manifests currently produce observations
-// and no diagnostic. Recorded in the audit as a gap.
+// 10 (negative): malformed non-JSON manifests are reported, not guessed.
 #[test]
-fn known_limitation_malformed_manifests_emit_no_diagnostic() {
+fn malformed_manifests_emit_explicit_diagnostics() {
     let root = temp_dir();
     write(&root.join("pyproject.toml"), "[project\nname = ");
     let info = json(&root, &["--json", "info"]);
     assert_eq!(info["ecosystem"], "python");
     let diagnostics = info["diagnostics"].to_string();
-    assert!(!diagnostics.contains("pyproject"), "{diagnostics}");
+    assert!(diagnostics.contains("pyproject.toml"), "{diagnostics}");
+    assert!(diagnostics.contains("error"), "{diagnostics}");
+    assert_eq!(info["outcome"], "partial");
 
     let cargo = temp_dir();
     write(&cargo.join("Cargo.toml"), "[package\nname=");
     let info = json(&cargo, &["--json", "info"]);
+    let diagnostics = info["diagnostics"].to_string();
+    assert!(diagnostics.contains("Cargo.toml"), "{diagnostics}");
+    assert!(diagnostics.contains("error"), "{diagnostics}");
     // Provenance is retained: the source names the fallback parser.
     assert_eq!(info["cargo"]["source"], "Cargo.toml fallback");
 }
@@ -327,9 +331,9 @@ fn known_limitation_runtime_requirements_are_not_observed_or_reported() {
     assert!(doctor["result"]["runtime"].is_null());
 }
 
-// Parsers that are heuristic, not ecosystem-authoritative (audit table).
+// Parsers read the ecosystem-authoritative declaration sections, not metadata.
 #[test]
-fn known_limitation_pyproject_metadata_is_reported_as_dependencies() {
+fn pyproject_dependencies_are_read_without_project_metadata() {
     let root = temp_dir();
     python_project(&root);
     let deps = json(&root, &["--json", "deps"]);
@@ -339,36 +343,36 @@ fn known_limitation_pyproject_metadata_is_reported_as_dependencies() {
         .iter()
         .map(|dependency| dependency["name"].as_str().unwrap())
         .collect();
-    // `name` and `version` are project metadata; `requests` is never extracted.
+    assert!(names.contains(&"requests"), "{names:?}");
     assert!(
-        names.contains(&"name") && names.contains(&"version"),
+        !names.contains(&"name") && !names.contains(&"version"),
         "{names:?}"
     );
-    assert!(!names.contains(&"requests"), "{names:?}");
 }
 
 #[test]
-fn known_limitation_requirements_txt_alone_yields_no_dependencies() {
+fn requirements_txt_alone_yields_dependencies() {
     let root = temp_dir();
     write(&root.join("requirements.txt"), "requests>=2\n");
     let info = json(&root, &["--json", "info"]);
     assert_eq!(info["ecosystem"], "python");
-    assert!(info["nativeDependencies"].as_array().unwrap().is_empty());
+    let dependencies = info["nativeDependencies"].as_array().unwrap();
+    assert_eq!(dependencies.len(), 1, "{dependencies:?}");
+    assert_eq!(dependencies[0]["name"], "requests");
+    assert_eq!(dependencies[0]["specifier"], ">=2");
+    assert_eq!(dependencies[0]["source"], "requirements.txt");
 }
 
 #[test]
-fn known_limitation_compose_keys_are_reported_as_services() {
+fn compose_services_are_limited_to_direct_children_of_services() {
     let root = temp_dir();
     write(
         &root.join("compose.yaml"),
         "services:\n  web:\n    image: nginx\n    ports:\n      - \"80:80\"\n    build:\n      context: .\n",
     );
     let info = json(&root, &["--json", "info"]);
-    let services = info["container"]["services"].to_string();
-    assert!(
-        services.contains("web") && services.contains("ports"),
-        "{services}"
-    );
+    let services = info["container"]["services"].as_array().unwrap();
+    assert_eq!(services, &[serde_json::json!("web")]);
 }
 
 #[test]

@@ -1,0 +1,7 @@
+{
+  "name": "root",
+  "private": true,
+  "dependencies": {
+    "typescript": "^5.4.0"
+  }
+}

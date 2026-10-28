@@ -1,0 +1,9 @@
+{
+  "name": "@example/web",
+  "dependencies": {
+    "react": "^18.3.0"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}

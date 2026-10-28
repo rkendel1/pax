@@ -1,0 +1,5 @@
+# runtime dependencies
+flask>=3.0
+requests[socks]>=2 ; python_version >= "3.9"  # pinned range
+-r requirements-dev.txt
+git+https://example.com/example/project.git#egg=example

@@ -56,6 +56,8 @@ struct NativeDependency {
     kind: String,
     ecosystem: Ecosystem,
     native_kind: String,
+    /// Project-relative manifest or requirements file that declared this dependency.
+    source: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -430,6 +432,9 @@ struct RepositoryDetection {
     native_dependencies: Vec<NativeDependency>,
     container: Option<ContainerInfo>,
     cargo: Option<CargoObservation>,
+    /// Problems found while reading manifests. They are reported alongside the
+    /// built-in JavaScript/Cargo diagnostics.
+    detection_diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -735,6 +740,28 @@ fn dispatch_observation(
     }
 }
 
+/// Returns the component whose directory owns a project-relative dependency
+/// source, using the most specific (longest) matching component path.
+fn dependency_owner<'a>(
+    source: &str,
+    components: &'a [Component],
+    ecosystem: Ecosystem,
+) -> Option<&'a Component> {
+    components
+        .iter()
+        .filter(|component| component.ecosystem == ecosystem)
+        .filter(|component| {
+            if component.path == "." {
+                true
+            } else {
+                source
+                    .strip_prefix(&component.path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            }
+        })
+        .max_by_key(|component| component.path.len())
+}
+
 fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -788,16 +815,22 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
                     .get(&manifest_path)
                     .map_or(&[][..], Vec::as_slice)
             });
-        for dependency in per_package.map_or_else(
-            || {
-                detection
-                    .native_dependencies
-                    .iter()
-                    .filter(|dependency| dependency.ecosystem == component.ecosystem)
-                    .collect::<Vec<_>>()
-            },
-            |dependencies| dependencies.iter().collect(),
-        ) {
+        let owned_dependencies = detection
+            .native_dependencies
+            .iter()
+            .filter(|dependency| dependency.ecosystem == component.ecosystem)
+            .filter(|dependency| {
+                dependency_owner(
+                    &dependency.source,
+                    &detection.components,
+                    dependency.ecosystem,
+                )
+                .is_some_and(|owner| owner.path == component.path)
+            })
+            .collect::<Vec<_>>();
+        for dependency in per_package.map_or(owned_dependencies, |dependencies| {
+            dependencies.iter().collect()
+        }) {
             let id = dependency.name.clone();
             nodes.push(GraphNode {
                 id: id.clone(),
@@ -819,18 +852,7 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
             });
             evidence.push(GraphEvidence {
                 edge: format!("{} -> {}", component.path, id),
-                evidence: component
-                    .manifests
-                    .first()
-                    .map(|manifest| {
-                        if component.path == "." {
-                            manifest.clone()
-                        } else {
-                            format!("{}/{}", component.path, manifest)
-                        }
-                    })
-                    .into_iter()
-                    .collect(),
+                evidence: vec![dependency.source.clone()],
             });
         }
     }
@@ -880,6 +902,41 @@ fn build_graph(detection: &RepositoryDetection) -> GraphOutput {
     }
 }
 
+/// Returns the project-relative `node_modules/` location visible to a
+/// JavaScript component, walking ancestors so hoisted workspace installs are
+/// recognized.
+fn javascript_node_modules(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> Option<String> {
+    let mut dir = if component.path == "." {
+        detection.root.clone()
+    } else {
+        detection.root.join(&component.path)
+    };
+    loop {
+        if dir.join("node_modules").is_dir() {
+            let relative = dir
+                .strip_prefix(&detection.root)
+                .ok()
+                .and_then(Path::to_str)
+                .filter(|relative| !relative.is_empty());
+            return Some(match relative {
+                Some(relative) => format!("{relative}/node_modules/"),
+                None => "node_modules/".to_string(),
+            });
+        }
+        if dir == detection.root {
+            return None;
+        }
+        let parent = dir.parent()?.to_path_buf();
+        if !parent.starts_with(&detection.root) {
+            return None;
+        }
+        dir = parent;
+    }
+}
+
 fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
     let declared: Vec<RealityObservation> = detection
         .components
@@ -923,13 +980,10 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         .map(|component| {
             let path = detection.root.join(&component.path);
             let (status, evidence) = match component.ecosystem {
-                Ecosystem::JavaScript => {
-                    let installed = path.join("node_modules").is_dir();
-                    (
-                        if installed { "present" } else { "absent" },
-                        vec!["node_modules/".to_string()],
-                    )
-                }
+                Ecosystem::JavaScript => match javascript_node_modules(detection, component) {
+                    Some(source) => ("present", vec![source]),
+                    None => ("absent", vec!["node_modules/".to_string()]),
+                },
                 Ecosystem::Rust => {
                     if path.join("target").is_dir() {
                         ("present", vec!["target/".to_string()])
@@ -1115,11 +1169,7 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
             });
         }
         if component.ecosystem == Ecosystem::JavaScript
-            && !detection
-                .root
-                .join(&component.path)
-                .join("node_modules")
-                .is_dir()
+            && javascript_node_modules(detection, component).is_none()
         {
             issues.push(DriftItem {
                 subject: component.path.clone(),
@@ -1610,6 +1660,12 @@ fn build_x_command(
         match component.tool.as_deref() {
             Some("uv") => "uvx",
             Some("poetry" | "pdm" | "pip") => "pipx",
+            Some("pipenv") => {
+                return Err(CliError {
+                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                    exit_code: 2,
+                });
+            }
             _ => {
                 return Err(CliError {
                     message: "could not detect an authoritative package runner".to_string(),
@@ -1664,6 +1720,12 @@ fn build_install_command(
             "pip" => "pip",
             "poetry" => "poetry",
             "pdm" => "pdm",
+            "pipenv" => {
+                return Err(CliError {
+                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                    exit_code: 2,
+                });
+            }
             _ => {
                 return Err(CliError {
                     message: format!("unsupported package manager tool: {tool}"),
@@ -1706,6 +1768,12 @@ fn build_install_command(
         Some("poetry") => "poetry",
         Some("pdm") => "pdm",
         Some("pip") => "pip",
+        Some("pipenv") => {
+            return Err(CliError {
+                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                exit_code: 2,
+            });
+        }
         _ => {
             return Err(CliError {
                 message: "could not detect an authoritative package manager".to_string(),
@@ -1762,6 +1830,12 @@ fn build_package_mutation_command(
         "bun" => ("bun", if add { "add" } else { "remove" }),
         "uv" => ("uv", if add { "add" } else { "remove" }),
         "cargo" => ("cargo", if add { "add" } else { "remove" }),
+        "pipenv" => {
+            return Err(CliError {
+                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                exit_code: 2,
+            });
+        }
         _ => {
             return Err(CliError {
                 message: format!("unsupported canonical package operation for {tool}"),
@@ -1956,6 +2030,12 @@ fn resolve_root_install_command(
             exit_code: 1,
         })?;
     let (program, args) = match tool {
+        "pipenv" => {
+            return Err(CliError {
+                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                exit_code: 2,
+            });
+        }
         "uv" => ("uv", vec!["sync".to_string()]),
         "poetry" | "pdm" => (tool, vec!["install".to_string()]),
         "pip" => {
@@ -2203,6 +2283,12 @@ fn build_run_command(
         }
         let mut args = Vec::new();
         let program = match tool {
+            "pipenv" => {
+                return Err(CliError {
+                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                    exit_code: 2,
+                });
+            }
             "uv" | "poetry" | "pdm" => {
                 args.push("run".to_string());
                 tool
@@ -2289,6 +2375,12 @@ fn build_run_command(
             component.tool.clone().unwrap()
         }
         (Ecosystem::Python, Some("pip")) => "python".to_string(),
+        (Ecosystem::Python, Some("pipenv")) => {
+            return Err(CliError {
+                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
+                exit_code: 2,
+            });
+        }
         (Ecosystem::Rust, Some("cargo")) => {
             args.extend(["run".to_string(), "--bin".to_string(), target.clone()]);
             args.extend(["--".to_string()]);
@@ -2322,10 +2414,11 @@ fn build_run_command(
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
-    let cargo = detect_cargo(root);
+    let mut detection_diagnostics = Vec::new();
+    let cargo = detect_cargo(root, &mut detection_diagnostics);
     let package_json_path = root.join("package.json");
     let package_json_data = if package_json_path.is_file() {
-        Some(read_package_json(&package_json_path)?)
+        Some(read_package_json(&package_json_path, "package.json")?)
     } else {
         None
     };
@@ -2406,7 +2499,8 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
             })
         })
         .unwrap_or(fallback_name);
-    let (mut components, mut native_dependencies, container) = detect_components(root);
+    let (mut components, mut native_dependencies, container) =
+        detect_components(root, &mut detection_diagnostics);
     if let Some(cargo) = &cargo {
         if let Some(component) = components
             .iter_mut()
@@ -2446,6 +2540,7 @@ fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
         native_dependencies,
         container,
         cargo,
+        detection_diagnostics,
     })
 }
 
@@ -2462,15 +2557,21 @@ fn display_path(path: &Path, root: &Path) -> String {
         .unwrap_or_else(|| "external/unknown".to_string())
 }
 
-fn detect_cargo(root: &Path) -> Option<CargoObservation> {
+fn detect_cargo(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<CargoObservation> {
     let manifest_path = root.join("Cargo.toml");
     if !manifest_path.is_file() {
         return None;
     }
     let manifest_contents = fs::read_to_string(&manifest_path).unwrap_or_default();
-    let declares_workspace = manifest_contents
-        .lines()
-        .any(|line| line.trim() == "[workspace]");
+    let manifest = toml::from_str::<toml::Value>(&manifest_contents);
+    if let Err(error) = &manifest {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            check: "Cargo.toml",
+            message: format!("failed to parse Cargo.toml: {error}"),
+        });
+    }
+    let declares_workspace = declares_workspace_section(&manifest_contents);
     let metadata = Command::new("cargo")
         .args([
             "metadata",
@@ -2545,6 +2646,7 @@ fn detect_cargo(root: &Path) -> Option<CargoObservation> {
                             } else {
                                 kind.to_string()
                             },
+                            source: manifest.clone(),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -2574,11 +2676,33 @@ fn detect_cargo(root: &Path) -> Option<CargoObservation> {
         });
     }
 
-    let package_name = manifest_contents.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "name").then(|| value.trim().trim_matches(['\"', '\'']).to_string())
-    });
-    let members = parse_toml_list(&manifest_contents, "[workspace]", "members");
+    let package_name = manifest
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("package"))
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            manifest_contents.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "name").then(|| value.trim().trim_matches(['"', '\'']).to_string())
+            })
+        });
+    let members = manifest
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("workspace"))
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| parse_toml_list(&manifest_contents, "[workspace]", "members"));
     Some(CargoObservation {
         manifest: "Cargo.toml".to_string(),
         lockfile: root
@@ -2608,13 +2732,34 @@ fn sort_dependencies(dependencies: &mut Vec<NativeDependency>) {
             .cmp(&b.name)
             .then(a.kind.cmp(&b.kind))
             .then(a.specifier.cmp(&b.specifier))
+            .then(a.source.cmp(&b.source))
     });
-    dependencies
-        .dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.specifier == b.specifier);
+    dependencies.dedup_by(|a, b| {
+        a.name == b.name && a.kind == b.kind && a.specifier == b.specifier && a.source == b.source
+    });
+}
+
+const JAVASCRIPT_LOCKFILES: [&str; 5] = [
+    "bun.lock",
+    "bun.lockb",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+];
+
+/// Joins a component directory (`"."` for the project root) with a file name.
+/// The result is a project-relative identity, never an absolute path.
+fn join_project_path(relative: &str, file: &str) -> String {
+    if relative == "." {
+        file.to_string()
+    } else {
+        format!("{relative}/{file}")
+    }
 }
 
 fn detect_components(
     root: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<Component>, Vec<NativeDependency>, Option<ContainerInfo>) {
     let mut roots = Vec::new();
     collect_project_dirs(root, &mut roots);
@@ -2629,83 +2774,25 @@ fn detect_components(
             .filter(|path| !path.is_empty())
             .unwrap_or(".")
             .to_string();
-        if let Some(component) = detect_python_component(root, &path, &relative, &mut dependencies)
+        if let Some(component) =
+            detect_python_component(root, &path, &relative, &mut dependencies, diagnostics)
         {
             components.push(component);
         }
-        if let Some(component) = detect_rust_component(root, &path, &relative, &mut dependencies) {
+        if let Some(component) =
+            detect_rust_component(root, &path, &relative, &mut dependencies, diagnostics)
+        {
             components.push(component);
         }
         if let Some(component) = detect_container_component(root, &path, &relative, &mut container)
         {
             components.push(component);
         }
-    }
-    if root.join("package.json").is_file() {
-        let manager = detect_repository_manager_name(root);
-        let lockfiles = [
-            "bun.lock",
-            "bun.lockb",
-            "pnpm-lock.yaml",
-            "yarn.lock",
-            "package-lock.json",
-        ]
-        .iter()
-        .filter(|name| root.join(name).is_file())
-        .map(|name| name.to_string())
-        .collect::<Vec<_>>();
-        let component = Component {
-            path: ".".to_string(),
-            ecosystem: Ecosystem::JavaScript,
-            tool: manager,
-            manifests: vec!["package.json".to_string()],
-            lockfiles: lockfiles.clone(),
-            evidence: std::iter::once(EvidenceItem {
-                kind: "manifest".to_string(),
-                path: "package.json".to_string(),
-            })
-            .chain(lockfiles.iter().map(|path| EvidenceItem {
-                kind: "lockfile".to_string(),
-                path: path.clone(),
-            }))
-            .collect(),
-            workspace_packages: Vec::new(),
-            dependency_sources: lockfiles
-                .iter()
-                .map(|path| DependencySource {
-                    kind: "lockfile".to_string(),
-                    path: path.clone(),
-                })
-                .collect(),
-        };
-        components.insert(0, component);
-    }
-
-    fn detect_repository_manager_name(root: &Path) -> Option<String> {
-        let package = fs::read_to_string(root.join("package.json")).ok()?;
-        let value = serde_json::from_str::<serde_json::Value>(&package).ok()?;
-        value
-            .get("packageManager")
-            .and_then(|value| value.as_str())
-            .and_then(|value| {
-                value
-                    .split('@')
-                    .next()
-                    .filter(|name| ["npm", "pnpm", "bun", "yarn"].contains(name))
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                [
-                    ("bun.lock", "bun"),
-                    ("bun.lockb", "bun"),
-                    ("pnpm-lock.yaml", "pnpm"),
-                    ("yarn.lock", "yarn"),
-                    ("package-lock.json", "npm"),
-                ]
-                .iter()
-                .find(|(file, _)| root.join(file).is_file())
-                .map(|(_, name)| (*name).to_string())
-            })
+        if let Some(component) =
+            detect_javascript_component(root, &path, &relative, &mut dependencies, diagnostics)
+        {
+            components.push(component);
+        }
     }
     components.sort_by(|a, b| {
         a.path
@@ -2713,6 +2800,114 @@ fn detect_components(
             .then_with(|| format!("{:?}", a.ecosystem).cmp(&format!("{:?}", b.ecosystem)))
     });
     (components, dependencies, container)
+}
+
+fn detect_javascript_component(
+    _root: &Path,
+    path: &Path,
+    relative: &str,
+    dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Component> {
+    let manifest = path.join("package.json");
+    if !manifest.is_file() {
+        return None;
+    }
+    let source = join_project_path(relative, "package.json");
+    let lockfiles = JAVASCRIPT_LOCKFILES
+        .iter()
+        .filter(|name| path.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let tool = detect_javascript_manager(path);
+    if relative != "." {
+        match read_package_json(&manifest, &source) {
+            Ok(data) => {
+                for (group, kind, native_kind) in [
+                    (data.dependencies, "dependency", "runtime-dependency"),
+                    (
+                        data.dev_dependencies,
+                        "development",
+                        "development-dependency",
+                    ),
+                    (
+                        data.optional_dependencies,
+                        "optional",
+                        "optional-dependency",
+                    ),
+                    (data.peer_dependencies, "peer", "peer-dependency"),
+                ] {
+                    for (name, specifier) in group {
+                        dependencies.push(NativeDependency {
+                            name,
+                            specifier,
+                            kind: kind.to_string(),
+                            ecosystem: Ecosystem::JavaScript,
+                            native_kind: native_kind.to_string(),
+                            source: source.clone(),
+                        });
+                    }
+                }
+            }
+            Err(error) => diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                check: "package.json",
+                message: error.message,
+            }),
+        }
+    }
+    let evidence = std::iter::once(EvidenceItem {
+        kind: "manifest".to_string(),
+        path: "package.json".to_string(),
+    })
+    .chain(lockfiles.iter().map(|path| EvidenceItem {
+        kind: "lockfile".to_string(),
+        path: path.clone(),
+    }))
+    .collect();
+    Some(Component {
+        path: relative.to_string(),
+        ecosystem: Ecosystem::JavaScript,
+        tool,
+        manifests: vec!["package.json".to_string()],
+        lockfiles: lockfiles.clone(),
+        evidence,
+        workspace_packages: Vec::new(),
+        dependency_sources: lockfiles
+            .iter()
+            .map(|path| DependencySource {
+                kind: "lockfile".to_string(),
+                path: path.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn detect_javascript_manager(path: &Path) -> Option<String> {
+    let package = fs::read_to_string(path.join("package.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&package).ok()?;
+    value
+        .get("packageManager")
+        .and_then(|value| value.as_str())
+        .and_then(|value| {
+            value
+                .split('@')
+                .next()
+                .filter(|name| ["npm", "pnpm", "bun", "yarn"].contains(name))
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            [
+                ("bun.lock", "bun"),
+                ("bun.lockb", "bun"),
+                ("pnpm-lock.yaml", "pnpm"),
+                ("yarn.lock", "yarn"),
+                ("package-lock.json", "npm"),
+            ]
+            .iter()
+            .find(|(file, _)| path.join(file).is_file())
+            .map(|(_, name)| (*name).to_string())
+        })
 }
 
 fn collect_project_dirs(path: &Path, roots: &mut Vec<PathBuf>) {
@@ -2731,99 +2926,134 @@ fn collect_project_dirs(path: &Path, roots: &mut Vec<PathBuf>) {
 }
 
 fn detect_python_component(
-    root: &Path,
+    _root: &Path,
     path: &Path,
     relative: &str,
     dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Component> {
-    let manifests = ["pyproject.toml", "requirements.txt", "Pipfile"];
-    let mut found = manifests
-        .iter()
-        .filter(|name| path.join(name).is_file())
-        .map(|name| name.to_string())
-        .collect::<Vec<_>>();
+    let pyproject_present = path.join("pyproject.toml").is_file();
+    let pipfile_present = path.join("Pipfile").is_file();
+    let mut found = Vec::new();
+    if pyproject_present {
+        found.push("pyproject.toml".to_string());
+    }
+    if pipfile_present {
+        found.push("Pipfile".to_string());
+    }
+    if let Ok(entries) = fs::read_dir(path) {
+        let mut requirements = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                (name.starts_with("requirements")
+                    && name.ends_with(".txt")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        requirements.sort();
+        found.extend(requirements);
+    }
     if let Ok(entries) = fs::read_dir(path.join("requirements")) {
-        found.extend(entries.flatten().filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (name.ends_with(".txt")).then_some(format!("requirements/{name}"))
-        }));
+        let mut requirements = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                (name.ends_with(".txt") && entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        requirements.sort();
+        found.extend(
+            requirements
+                .into_iter()
+                .map(|name| format!("requirements/{name}")),
+        );
     }
     let lockfiles = ["uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock"]
         .iter()
         .filter(|name| path.join(name).is_file())
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
-    if found.is_empty() && lockfiles.is_empty() && !path.join("requirements").is_dir() {
+    if found.is_empty() && lockfiles.is_empty() {
         return None;
     }
-    let tool = if path.join("uv.lock").is_file() {
-        "uv"
-    } else if path.join("poetry.lock").is_file() {
-        "poetry"
-    } else if path.join("pdm.lock").is_file() {
-        "pdm"
-    } else {
-        "pip"
-    };
-    if let Ok(contents) = fs::read_to_string(path.join("pyproject.toml")) {
-        let mut kind = "dependency";
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if let Some((name, specifier)) = trimmed.split_once('=') {
-                let name = name.trim().trim_matches('"').trim_matches('\'');
-                if name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    && !name.is_empty()
-                    && (specifier.contains('"') || specifier.contains('\''))
-                {
-                    dependencies.push(NativeDependency {
-                        name: name.to_string(),
-                        specifier: specifier
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string(),
-                        kind: kind.to_string(),
-                        ecosystem: Ecosystem::Python,
-                        native_kind: if trimmed.contains("optional") {
-                            "optional-dependency".to_string()
-                        } else {
-                            "dependency-group".to_string()
-                        },
-                    });
-                }
+
+    if pyproject_present && pipfile_present {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warn,
+            check: "Python manifests",
+            message: format!(
+                "{} declares both pyproject.toml and Pipfile; pyproject.toml is interpreted",
+                project_label(relative)
+            ),
+        });
+    }
+
+    for manifest in &found {
+        let source = join_project_path(relative, manifest);
+        if manifest == "pyproject.toml" {
+            if let Some(value) =
+                read_python_manifest(&path.join(manifest), &source, "pyproject.toml", diagnostics)
+            {
+                parse_pyproject(&value, &source, dependencies, diagnostics);
             }
-            for manifest in &found {
-                if manifest.ends_with(".txt") {
-                    let contents = fs::read_to_string(path.join(manifest)).unwrap_or_default();
-                    for line in contents
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    {
-                        let name = line
-                            .split(['=', '<', '>', '!', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim();
-                        if !name.is_empty() {
-                            dependencies.push(NativeDependency {
-                                name: name.to_string(),
-                                specifier: line[name.len()..].trim().to_string(),
-                                kind: "dependency".to_string(),
-                                ecosystem: Ecosystem::Python,
-                                native_kind: "requirements".to_string(),
-                            });
-                        }
-                    }
-                }
+        } else if manifest == "Pipfile" {
+            // pyproject.toml wins when both manifests exist; the warning above
+            // records the ambiguity.
+            if pyproject_present {
+                continue;
             }
-            if trimmed.starts_with('[') && trimmed.contains("dev") {
-                kind = "development";
+            if let Some(value) =
+                read_python_manifest(&path.join(manifest), &source, "Pipfile", diagnostics)
+            {
+                parse_pipfile(&value, &source, dependencies);
             }
+        } else {
+            parse_requirements_file(&path.join(manifest), &source, dependencies, diagnostics);
         }
     }
+
+    let tool = python_tool(path, pyproject_present, pipfile_present);
+    let manifest_sources = found
+        .iter()
+        .map(|manifest| join_project_path(relative, manifest))
+        .collect::<Vec<_>>();
+    if manifest_sources.is_empty() {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "Python project",
+            message: format!(
+                "Python lockfile found without a manifest at {}",
+                project_label(relative)
+            ),
+        });
+    } else {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "Python project",
+            message: format!(
+                "{} found at {}",
+                manifest_sources.join(", "),
+                project_label(relative)
+            ),
+        });
+    }
+    diagnostics.push(Diagnostic {
+        level: if lockfiles.is_empty() {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        message: if lockfiles.is_empty() {
+            "No Python lockfile detected".to_string()
+        } else {
+            format!("Found {}", lockfiles.join(", "))
+        },
+        check: "Python lockfile",
+    });
+
     let evidence = found
         .iter()
         .map(|path| EvidenceItem {
@@ -2835,7 +3065,6 @@ fn detect_python_component(
             path: path.clone(),
         }))
         .collect();
-    let _ = root;
     Some(Component {
         path: relative.to_string(),
         ecosystem: Ecosystem::Python,
@@ -2847,10 +3076,10 @@ fn detect_python_component(
         dependency_sources: found
             .iter()
             .map(|path| DependencySource {
-                kind: if path == "pyproject.toml" {
-                    "manifest".to_string()
-                } else {
+                kind: if path.ends_with(".txt") {
                     "requirements".to_string()
+                } else {
+                    "manifest".to_string()
                 },
                 path: path.clone(),
             })
@@ -2859,6 +3088,427 @@ fn detect_python_component(
                 path: path.clone(),
             }))
             .collect(),
+    })
+}
+
+fn project_label(relative: &str) -> String {
+    if relative == "." {
+        "the project root".to_string()
+    } else {
+        relative.to_string()
+    }
+}
+
+fn read_python_manifest(
+    path: &Path,
+    source: &str,
+    check: &'static str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<toml::Value> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                check,
+                message: format!("failed to read {source}: {error}"),
+            });
+            return None;
+        }
+    };
+    match toml::from_str::<toml::Value>(&contents) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                check,
+                message: format!("failed to parse {source}: {error}"),
+            });
+            None
+        }
+    }
+}
+
+fn python_tool(path: &Path, pyproject_present: bool, pipfile_present: bool) -> &'static str {
+    if path.join("uv.lock").is_file() {
+        "uv"
+    } else if path.join("poetry.lock").is_file() {
+        "poetry"
+    } else if path.join("pdm.lock").is_file() {
+        "pdm"
+    } else if pipfile_present && !pyproject_present {
+        // A Pipfile is interpreted only when no pyproject.toml competes with it.
+        "pipenv"
+    } else {
+        "pip"
+    }
+}
+
+fn parse_pyproject(
+    value: &toml::Value,
+    source: &str,
+    dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(project) = value.get("project") {
+        add_requirement_list(
+            project.get("dependencies"),
+            "dependency",
+            "dependency",
+            source,
+            dependencies,
+            diagnostics,
+        );
+        if let Some(groups) = project
+            .get("optional-dependencies")
+            .and_then(toml::Value::as_table)
+        {
+            for (group, requirements) in groups {
+                add_requirement_list(
+                    Some(requirements),
+                    dependency_group_kind(group),
+                    "optional-dependency",
+                    source,
+                    dependencies,
+                    diagnostics,
+                );
+            }
+        }
+    }
+
+    if let Some(groups) = value
+        .get("dependency-groups")
+        .and_then(toml::Value::as_table)
+    {
+        for (group, requirements) in groups {
+            add_requirement_list(
+                Some(requirements),
+                dependency_group_kind(group),
+                "dependency-group",
+                source,
+                dependencies,
+                diagnostics,
+            );
+        }
+    }
+
+    if let Some(poetry) = value.get("tool").and_then(|tool| tool.get("poetry")) {
+        add_poetry_dependencies(
+            poetry.get("dependencies"),
+            "dependency",
+            source,
+            dependencies,
+        );
+        add_poetry_dependencies(
+            poetry.get("dev-dependencies"),
+            "development",
+            source,
+            dependencies,
+        );
+        if let Some(groups) = poetry.get("group").and_then(toml::Value::as_table) {
+            for (group, group_value) in groups {
+                add_poetry_dependencies(
+                    group_value.get("dependencies"),
+                    dependency_group_kind(group),
+                    source,
+                    dependencies,
+                );
+            }
+        }
+    }
+
+    if let Some(requires) = value
+        .get("build-system")
+        .and_then(|build_system| build_system.get("requires"))
+    {
+        add_requirement_list(
+            Some(requires),
+            "build",
+            "build-requirement",
+            source,
+            dependencies,
+            diagnostics,
+        );
+    }
+}
+
+fn add_requirement_list(
+    value: Option<&toml::Value>,
+    kind: &str,
+    native_kind: &str,
+    source: &str,
+    dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(entries) = value.as_array() else {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            check: "pyproject.toml",
+            message: format!("{source}: expected an array of requirement strings"),
+        });
+        return;
+    };
+    for entry in entries {
+        match entry {
+            toml::Value::String(requirement) => match parse_requirement(requirement) {
+                Some((name, specifier)) => dependencies.push(NativeDependency {
+                    name,
+                    specifier,
+                    kind: kind.to_string(),
+                    ecosystem: Ecosystem::Python,
+                    native_kind: native_kind.to_string(),
+                    source: source.to_string(),
+                }),
+                None => diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warn,
+                    check: "pyproject.toml",
+                    message: format!("{source}: could not interpret requirement {requirement:?}"),
+                }),
+            },
+            toml::Value::Table(table) if table.contains_key("include-group") => {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warn,
+                    check: "pyproject.toml",
+                    message: format!("{source}: dependency-group include entries are not expanded"),
+                });
+            }
+            _ => diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warn,
+                check: "pyproject.toml",
+                message: format!("{source}: unsupported dependency entry"),
+            }),
+        }
+    }
+}
+
+fn add_poetry_dependencies(
+    value: Option<&toml::Value>,
+    kind: &str,
+    source: &str,
+    dependencies: &mut Vec<NativeDependency>,
+) {
+    let Some(table) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (name, value) in table {
+        // `python` is the interpreter constraint, not a package.
+        if name == "python" {
+            continue;
+        }
+        dependencies.push(NativeDependency {
+            name: name.clone(),
+            specifier: poetry_specifier(value),
+            kind: kind.to_string(),
+            ecosystem: Ecosystem::Python,
+            native_kind: "poetry".to_string(),
+            source: source.to_string(),
+        });
+    }
+}
+
+fn poetry_specifier(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(specifier) => specifier.clone(),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("*")
+            .to_string(),
+        _ => "*".to_string(),
+    }
+}
+
+fn dependency_group_kind(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if ["dev", "test", "lint", "type", "doc"]
+        .iter()
+        .any(|marker| name.contains(marker))
+    {
+        "development"
+    } else {
+        "dependency"
+    }
+}
+
+fn parse_pipfile(value: &toml::Value, source: &str, dependencies: &mut Vec<NativeDependency>) {
+    for (section, kind) in [("packages", "dependency"), ("dev-packages", "development")] {
+        let Some(table) = value.get(section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (name, value) in table {
+            let specifier = match value {
+                toml::Value::String(specifier) => specifier.clone(),
+                toml::Value::Table(table) => table
+                    .get("version")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("*")
+                    .to_string(),
+                _ => "*".to_string(),
+            };
+            dependencies.push(NativeDependency {
+                name: name.clone(),
+                specifier,
+                kind: kind.to_string(),
+                ecosystem: Ecosystem::Python,
+                native_kind: "pipfile".to_string(),
+                source: source.to_string(),
+            });
+        }
+    }
+}
+
+fn parse_requirements_file(
+    path: &Path,
+    source: &str,
+    dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                check: "requirements",
+                message: format!("failed to read {source}: {error}"),
+            });
+            return;
+        }
+    };
+    let kind = requirements_kind(source);
+    let mut logical = String::new();
+    let mut start_line = 0;
+    for (index, raw) in contents.lines().enumerate() {
+        if logical.is_empty() {
+            start_line = index + 1;
+        }
+        let trimmed = raw.trim_end();
+        if let Some(continued) = trimmed.strip_suffix('\\') {
+            logical.push_str(continued.trim_end());
+            logical.push(' ');
+            continue;
+        }
+        logical.push_str(raw);
+        let line = std::mem::take(&mut logical);
+        parse_requirements_line(&line, start_line, source, kind, dependencies, diagnostics);
+    }
+    if !logical.is_empty() {
+        parse_requirements_line(
+            &logical,
+            start_line,
+            source,
+            kind,
+            dependencies,
+            diagnostics,
+        );
+    }
+}
+
+fn parse_requirements_line(
+    raw: &str,
+    line_number: usize,
+    source: &str,
+    kind: &str,
+    dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let line = strip_requirement_comment(raw).trim();
+    if line.is_empty() || line.starts_with('-') {
+        // Comments, blank lines, and pip options (`-r`, `-c`, `-e`, ...) are
+        // not package declarations.
+        return;
+    }
+    if line.contains("://")
+        || ["git+", "hg+", "svn+", "bzr+", "file:"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warn,
+            check: "requirements",
+            message: format!("{source}:{line_number}: URL requirement is not interpreted: {line}"),
+        });
+        return;
+    }
+    match parse_requirement(line) {
+        Some((name, specifier)) => dependencies.push(NativeDependency {
+            name,
+            specifier,
+            kind: kind.to_string(),
+            ecosystem: Ecosystem::Python,
+            native_kind: "requirements".to_string(),
+            source: source.to_string(),
+        }),
+        None => diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warn,
+            check: "requirements",
+            message: format!("{source}:{line_number}: could not interpret requirement: {line}"),
+        }),
+    }
+}
+
+fn strip_requirement_comment(line: &str) -> &str {
+    if line.trim_start().starts_with('#') {
+        return "";
+    }
+    let bytes = line.as_bytes();
+    for index in 1..bytes.len() {
+        if bytes[index] == b'#' && matches!(bytes[index - 1], b' ' | b'\t') {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn requirements_kind(source: &str) -> &'static str {
+    let file = source
+        .rsplit('/')
+        .next()
+        .unwrap_or(source)
+        .to_ascii_lowercase();
+    if file.contains("dev") || file.contains("test") {
+        "development"
+    } else {
+        "dependency"
+    }
+}
+
+fn parse_requirement(input: &str) -> Option<(String, String)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let name_length = input
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .unwrap_or(input.len());
+    let name = &input[..name_length];
+    if name.is_empty() || !name.chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
+    let mut rest = input[name_length..].trim_start();
+    if rest.starts_with('[') {
+        let end = rest.find(']')?;
+        rest = rest[end + 1..].trim_start();
+    }
+    let specifier = rest.split(';').next().unwrap_or("").trim();
+    Some((
+        name.to_string(),
+        if specifier.is_empty() {
+            "*".to_string()
+        } else {
+            specifier.to_string()
+        },
+    ))
+}
+
+fn declares_workspace_section(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let header = line.split('#').next().unwrap_or("").trim();
+        header == "[workspace]"
     })
 }
 
@@ -2873,8 +3523,9 @@ fn parse_toml_list(contents: &str, section_name: &str, key: &str) -> Vec<String>
         {
             return trimmed
                 .split_once('=')
-                .map(|(_, value)| value.trim().trim_matches(['[', ']'].as_ref()))
+                .map(|(_, value)| value.split('#').next().unwrap_or("").trim())
                 .unwrap_or_default()
+                .trim_matches(['[', ']'].as_ref())
                 .split(',')
                 .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
                 .filter(|item| !item.is_empty())
@@ -2889,8 +3540,10 @@ fn detect_rust_component(
     path: &Path,
     relative: &str,
     dependencies: &mut Vec<NativeDependency>,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Component> {
-    if !path.join("Cargo.toml").is_file() {
+    let manifest = path.join("Cargo.toml");
+    if !manifest.is_file() {
         return None;
     }
     let lockfiles = ["Cargo.lock"]
@@ -2898,16 +3551,26 @@ fn detect_rust_component(
         .filter(|name| path.join(name).is_file())
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
-    let contents = fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
+    let source = join_project_path(relative, "Cargo.toml");
+    let contents = fs::read_to_string(&manifest).unwrap_or_default();
+    let parsed = toml::from_str::<toml::Value>(&contents).ok();
+    if parsed.is_none() && relative != "." {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            check: "Cargo.toml",
+            message: format!("failed to parse {source}"),
+        });
+    }
     let mut section = "other";
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            section = if trimmed.contains("dev-dependencies") {
+            let header = trimmed.split('#').next().unwrap_or("").trim();
+            section = if header.contains("dev-dependencies") {
                 "development"
-            } else if trimmed.contains("build-dependencies") {
+            } else if header.contains("build-dependencies") {
                 "build"
-            } else if trimmed == "[dependencies]" {
+            } else if header == "[dependencies]" {
                 "dependency"
             } else {
                 "other"
@@ -2928,10 +3591,24 @@ fn detect_rust_component(
                     kind: section.to_string(),
                     ecosystem: Ecosystem::Rust,
                     native_kind: section.to_string(),
+                    source: source.clone(),
                 });
             }
         }
     }
+    let workspace_packages = parsed
+        .as_ref()
+        .and_then(|value| value.get("workspace"))
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| parse_toml_list(&contents, "[workspace]", "members"));
     let evidence = vec![EvidenceItem {
         kind: "manifest".to_string(),
         path: "Cargo.toml".to_string(),
@@ -2949,7 +3626,7 @@ fn detect_rust_component(
         manifests: vec!["Cargo.toml".to_string()],
         lockfiles: lockfiles.clone(),
         evidence,
-        workspace_packages: parse_toml_list(&contents, "[workspace]", "members"),
+        workspace_packages,
         dependency_sources: lockfiles
             .iter()
             .map(|path| DependencySource {
@@ -3021,22 +3698,13 @@ fn detect_container_component(
     }
     for file in &compose_files {
         let contents = fs::read_to_string(path.join(file)).unwrap_or_default();
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if trimmed.ends_with(':')
-                && !trimmed.starts_with('-')
-                && !trimmed.starts_with('#')
-                && !trimmed.contains(' ')
-                && trimmed != "services:"
-                && !trimmed.starts_with("version")
-            {
-                info.services
-                    .push(trimmed.trim_end_matches(':').to_string());
-            }
-            if let Some(image) = trimmed.strip_prefix("image:") {
-                info.images.push(image.trim().to_string());
+        let (services, images) = parse_compose_file(&contents);
+        for service in services {
+            if !info.services.contains(&service) {
+                info.services.push(service);
             }
         }
+        info.images.extend(images);
     }
     *container = Some(info);
     let evidence = dockerfiles
@@ -3062,14 +3730,69 @@ fn detect_container_component(
     })
 }
 
-fn read_package_json(path: &Path) -> Result<PackageJsonData, CliError> {
+fn parse_compose_file(contents: &str) -> (Vec<String>, Vec<String>) {
+    let mut services = Vec::new();
+    let mut images = Vec::new();
+    let mut in_services = false;
+    let mut service_indent = None;
+    for raw in contents.lines() {
+        let line = strip_yaml_comment(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .count();
+        if indent == 0 {
+            in_services = trimmed == "services:";
+            service_indent = None;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        if service_indent.is_none() {
+            service_indent = Some(indent);
+        }
+        if let Some(image) = trimmed.strip_prefix("image:") {
+            let image = image.trim().trim_matches(['"', '\'']);
+            if !image.is_empty() {
+                images.push(image.to_string());
+            }
+        }
+        if Some(indent) == service_indent && trimmed.ends_with(':') && !trimmed.starts_with('-') {
+            let name = trimmed
+                .trim_end_matches(':')
+                .trim()
+                .trim_matches(['"', '\'']);
+            if !name.is_empty() && !services.iter().any(|service| service == name) {
+                services.push(name.to_string());
+            }
+        }
+    }
+    (services, images)
+}
+
+fn strip_yaml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for index in 1..bytes.len() {
+        if bytes[index] == b'#' && matches!(bytes[index - 1], b' ' | b'\t') {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn read_package_json(path: &Path, label: &str) -> Result<PackageJsonData, CliError> {
     let contents = fs::read_to_string(path).map_err(|error| CliError {
-        message: format!("failed to read {}: {error}", path.display()),
+        message: format!("failed to read {label}: {error}"),
         exit_code: 1,
     })?;
 
     let value = serde_json::from_str::<serde_json::Value>(&contents).map_err(|error| CliError {
-        message: format!("failed to parse {}: {error}", path.display()),
+        message: format!("failed to parse {label}: {error}"),
         exit_code: 1,
     })?;
 
@@ -3263,9 +3986,12 @@ fn inspection_outcome(
         .components
         .iter()
         .any(|component| component.ecosystem == Ecosystem::Python);
-    let python_lockfiles = detection.components.iter().any(|component| {
-        component.ecosystem == Ecosystem::Python && !component.lockfiles.is_empty()
-    });
+    let python_lockfile_count = detection
+        .components
+        .iter()
+        .filter(|component| component.ecosystem == Ecosystem::Python)
+        .flat_map(|component| component.lockfiles.iter())
+        .count();
     let only_container = !detection.components.is_empty()
         && detection
             .components
@@ -3276,15 +4002,13 @@ fn inspection_outcome(
         // Scripts are only observed for JavaScript manifests.
         "scripts" if !any_javascript => Some(Outcome::Unsupported),
         "scripts" if detection.components.len() > 1 => Some(Outcome::Partial),
-        // Python dependency parsing is explicitly incomplete; do not call it ok.
         "deps" if only_container => Some(Outcome::Unsupported),
-        "deps" if any_python => Some(Outcome::Partial),
         // Python workspace membership is not observed.
         "workspaces" if !any_javascript_or_rust => Some(Outcome::Unsupported),
         "workspaces" if any_python => Some(Outcome::Partial),
-        // Python lockfiles are detected but are not part of the lock document yet.
         "lock" if !any_javascript_or_rust && !any_python => Some(Outcome::Unsupported),
-        "lock" if python_lockfiles => Some(Outcome::Partial),
+        // Multiple Python lockfiles leave no single selected lockfile.
+        "lock" if python_lockfile_count > 1 => Some(Outcome::Partial),
         _ => None,
     };
     if let Some(outcome) = command_outcome {
@@ -3329,6 +4053,12 @@ fn build_output(
                 .as_ref()
                 .and_then(|cargo| cargo.lockfile.clone())
         });
+    let python_lockfile = detection
+        .components
+        .iter()
+        .find(|component| component.ecosystem == Ecosystem::Python)
+        .and_then(|component| component.lockfiles.first().cloned());
+    let lock_selected = manager_lockfile.clone().or(python_lockfile);
     let selected_by = detection
         .manager
         .as_ref()
@@ -3480,7 +4210,7 @@ fn build_output(
                 .collect(),
         }),
         lock: (command == "lock").then(|| LockOutput {
-            found: manager_lockfile.is_some(),
+            found: lock_selected.is_some(),
             files: detection
                 .lockfiles
                 .iter()
@@ -3491,8 +4221,15 @@ fn build_output(
                         .iter()
                         .filter_map(|cargo| cargo.lockfile.clone()),
                 )
+                .chain(
+                    detection
+                        .components
+                        .iter()
+                        .filter(|component| component.ecosystem == Ecosystem::Python)
+                        .flat_map(|component| component.lockfiles.iter().cloned()),
+                )
                 .collect(),
-            selected: manager_lockfile,
+            selected: lock_selected,
             manager: manager_name,
         }),
         ecosystem: {
@@ -3547,19 +4284,11 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
         });
     }
 
-    if detection.package_json || detection.cargo.is_none() {
+    if detection.package_json {
         diagnostics.push(Diagnostic {
-            level: if detection.package_json {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Error
-            },
+            level: DiagnosticLevel::Ok,
             check: "package.json",
-            message: if detection.package_json {
-                "package.json found".to_string()
-            } else {
-                "package.json is required to inspect a JavaScript package".to_string()
-            },
+            message: "package.json found".to_string(),
         });
 
         diagnostics.push(Diagnostic {
@@ -3574,6 +4303,20 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
             } else {
                 format!("Found {}", detection.lockfiles.join(", "))
             },
+        });
+    }
+
+    let nested_javascript = detection
+        .components
+        .iter()
+        .filter(|component| component.ecosystem == Ecosystem::JavaScript && component.path != ".")
+        .map(|component| join_project_path(&component.path, "package.json"))
+        .collect::<Vec<_>>();
+    if !nested_javascript.is_empty() {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Ok,
+            check: "JavaScript projects",
+            message: format!("package.json found at {}", nested_javascript.join(", ")),
         });
     }
 
@@ -3629,11 +4372,11 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
             message: "Not enough evidence to verify package/lock consistency".to_string(),
         },
     };
-    if detection.package_json || detection.cargo.is_none() {
+    if detection.package_json {
         diagnostics.push(package_lock_consistency);
     }
 
-    if detection.package_json || detection.cargo.is_none() {
+    if detection.package_json {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Ok,
             check: "workspace configuration",
@@ -3657,6 +4400,8 @@ fn build_diagnostics(detection: &RepositoryDetection) -> Vec<Diagnostic> {
             });
         }
     }
+
+    diagnostics.extend(detection.detection_diagnostics.iter().cloned());
 
     diagnostics
 }
@@ -3870,5 +4615,59 @@ mod tests {
         assert_eq!(value["manager"]["name"], json!("bun"));
         assert_eq!(value["project"]["workspace"], json!(true));
         assert_eq!(value["manager"]["lockfile"], json!("bun.lock"));
+    }
+
+    #[test]
+    fn compose_services_are_direct_children_only() {
+        let (services, images) = parse_compose_file(
+            "services:\n  web: # web\n    image: nginx:1\n    ports:\n      - \"80:80\"\n    environment:\n      DEBUG: \"1\"\n  db:\n    image: postgres:16\nvolumes:\n  data:\n    driver: local\n",
+        );
+        assert_eq!(services, vec!["web", "db"]);
+        assert_eq!(images, vec!["nginx:1", "postgres:16"]);
+    }
+
+    #[test]
+    fn requirements_keep_specifiers_and_drop_extras_and_markers() {
+        assert_eq!(
+            parse_requirement("requests[socks]>=2 ; python_version >= \"3.9\""),
+            Some(("requests".to_string(), ">=2".to_string()))
+        );
+        assert_eq!(
+            parse_requirement("flask"),
+            Some(("flask".to_string(), "*".to_string()))
+        );
+        assert_eq!(
+            strip_requirement_comment("flask>=3  # runtime").trim(),
+            "flask>=3"
+        );
+        assert_eq!(strip_requirement_comment("# whole line"), "");
+    }
+
+    #[test]
+    fn python_tool_prefers_pyproject_over_pipfile() {
+        let root = temp_dir();
+        write(&root.join("Pipfile"), "");
+        write(&root.join("Pipfile.lock"), "{}");
+        assert_eq!(python_tool(&root, false, true), "pipenv");
+        // pyproject.toml wins the ambiguity, so pipenv is not selected.
+        assert_eq!(python_tool(&root, true, true), "pip");
+    }
+
+    #[test]
+    fn cargo_workspace_headers_ignore_trailing_comments() {
+        assert!(declares_workspace_section(
+            "[workspace] # root workspace\nmembers = [\"crates/app\"]\n"
+        ));
+        assert!(!declares_workspace_section(
+            "[package]\nname = \"single\"\n"
+        ));
+        assert_eq!(
+            parse_toml_list(
+                "[workspace]\nmembers = [\"crates/app\", \"crates/lib\"] # members\n",
+                "[workspace]",
+                "members"
+            ),
+            vec!["crates/app", "crates/lib"]
+        );
     }
 }

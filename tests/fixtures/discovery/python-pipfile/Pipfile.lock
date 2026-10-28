@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "hash": { "sha256": "fixture" },
+    "pipfile-spec": 6,
+    "requires": { "python_version": "3.12" }
+  },
+  "default": {
+    "flask": { "version": "==3.0.3" },
+    "requests": { "version": "==2.32.3" }
+  },
+  "develop": {
+    "pytest": { "version": "==8.3.2" }
+  }
+}

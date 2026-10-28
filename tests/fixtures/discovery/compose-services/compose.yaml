@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  api: # api service
+    build: .
+    image: example/api:1
+    environment:
+      DATABASE_URL: postgres://db/app
+      FEATURE_FLAG: "yes"
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+
+networks:
+  default:
+    name: app
+
+volumes:
+  data:
+    driver: local

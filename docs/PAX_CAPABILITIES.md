@@ -8,21 +8,25 @@ what the code does, not what the README says. Details and evidence:
 v0.5.0 note: the schema/versioning row below describes the v0.3.0 baseline.
 Canonical schema identifiers, typed outcomes, project-relative graph
 identities, and the compatibility policy are now defined in
-[PAX_CONTRACT.md](PAX_CONTRACT.md).
+[PAX_CONTRACT.md](PAX_CONTRACT.md). Discovery and declaration parsing were
+corrected in 0.5.0: Python TOML/requirements/Pipfile are parsed, nested
+`package.json` manifests are components, malformed manifests produce
+diagnostics, Cargo workspaces are read from TOML, and Compose services are
+limited to `services:` children. Pipenv is discovered but not executable.
 
 ## Capabilities by owner
 
 | Capability | Current | Intended | Owner | Priority |
 | --- | --- | --- | --- | --- |
 | Project discovery (root + nested dirs, skipping dot-dirs, `target`, `node_modules`) | ✅ | defined | PAX | — |
-| Ecosystem detection (JS, Python, Rust, Container) | ⚠️ file-presence based; no diagnostic for unparseable manifests | defined, with explicit unparseable/unknown states | PAX | P1 |
+| Ecosystem detection (JS, Python, Rust, Container) | ✅ every recognized manifest is a component; malformed manifests produce Error diagnostics and `partial` | defined, with explicit unparseable/unknown states | PAX | — |
 | Package-manager selection (JS: `packageManager` > lockfile precedence; Python: lockfile; `--tool`) | ✅ deterministic, fail-closed on conflict | keep | PAX | — |
-| Dependency inspection: package.json | ✅ | keep | PAX | — |
-| Dependency inspection: Cargo | ✅ via `cargo metadata`; ⚠️ heuristic fallback (labelled `source`) | keep | PAX | — |
-| Dependency inspection: Python | ❌ pyproject reports project metadata as dependencies; `requirements.txt` alone yields none; no `requires-python` | correct parser or report "not interpreted" | PAX | **P0** |
+| Dependency inspection: package.json | ✅ root groups plus nested manifests as sourced native dependencies | keep | PAX | — |
+| Dependency inspection: Cargo | ✅ via `cargo metadata`; ⚠️ TOML fallback (labelled `source`) | keep | PAX | — |
+| Dependency inspection: Python | ✅ TOML (`[project]`, optional groups, `[dependency-groups]`, Poetry, build requires), `requirements*.txt` and `requirements/*.txt`, Pipfile | keep; pipenv execution stays unsupported | PAX | — |
 | Script inspection (package.json `scripts`) | ✅ | keep | PAX | — |
-| Workspace inspection (npm/pnpm, Cargo) | ✅ | keep | PAX | — |
-| Container inspection (Dockerfile directives, Compose) | ⚠️ line heuristics; Compose keys such as `ports` reported as services | correct or label as heuristic | PAX | P2 |
+| Workspace inspection (npm/pnpm, Cargo) | ✅ Cargo workspace membership from metadata or TOML | keep | PAX | — |
+| Container inspection (Dockerfile directives, Compose) | ✅ Compose services are direct children of `services:`; Dockerfile directives are line-scanned | keep | PAX | — |
 | Lockfile inspection | ⚠️ presence only; drift uses substring search for names | presence + explicit "not parsed" | PAX | P1 |
 | Installed-state observation | ⚠️ directory presence only (empty `node_modules/` = present; `target/` is not an install) | rename/limit claims | PAX | P1 |
 | Runtime observation (`--live`) | ❌ names `docker compose ps`, runs nothing | implement or remove the flag's claim | PAX (if kept) | **P0** (honesty) |
@@ -30,7 +34,7 @@ identities, and the compatibility policy are now defined in
 | Runtime/platform requirement extraction (`engines`, `requires-python`, `rust-version`, `.nvmrc`) | ❌ none read | declared-requirement observation | PAX | P1 |
 | Project structure observation (`pax observe`: Rust crate/module/file/declaration, bounded, per-fact provenance) | ✅ Rust only; see [PAX_OBSERVATION.md](PAX_OBSERVATION.md) for what it does not observe | keep narrow; no relevance or impact semantics | PAX | — |
 | Declared vs. observed distinction | ⚠️ layers in `reality`; evidence `kind` in `drift`; not in `info`/`deps` | uniform `declared`/`observed` provenance per field | PAX | P1 |
-| Observation provenance (what, where, how) | ⚠️ file lists for components, graph, reality; none for diagnostics, manager version | per-field source references | PAX | P1 |
+| Observation provenance (what, where, how) | ✅ file lists for components, graph, reality, drift; native dependencies name their `source`; diagnostics name a check | per-field source references | PAX | — |
 | Observation time | ❌ none (and intentionally deterministic) | optional, separable from semantic fields | PAX | P2 |
 | Confidence / unknown states | ⚠️ `unknown` in `reality` and live `drift` only | uniform | PAX | P1 |
 | Stable schema/versioning | ⚠️ `schemaVersion: "1"` (info family) vs `schema_version: "1"` (graph/reality/drift); no compatibility policy; execution result `pax.execution-result.v1` is the only self-describing contract | one convention + written policy | PAX | P1 |

@@ -1,0 +1,5 @@
+[packages]
+flask = ">=3.0"
+
+[dev-packages]
+pytest = ">=8"

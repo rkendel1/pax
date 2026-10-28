@@ -22,6 +22,27 @@
   drift exit-code semantics
 - add contract fixtures and `tests/contract.rs`; update README and observation
   docs
+- parse Python declarations from real TOML (`[project]`, optional dependency
+  groups, `[dependency-groups]`, Poetry sections, `[build-system].requires`),
+  standalone `requirements*.txt`, `requirements/*.txt`, and `Pipfile`; every
+  native dependency now carries a project-relative `source`
+- detect Pipfile projects with `tool: "pipenv"`; pipenv operations fail with an
+  explicit unsupported error
+- discover every `package.json` as a component, add nested declarations to
+  `nativeDependencies` with provenance, attribute graph edges to the declaring
+  component, and accept hoisted `node_modules/` for nested packages
+- parse `Cargo.toml` for workspace detection and members, including trailing
+  comments, instead of relying on line equality
+- limit Compose services to direct children of `services:` and deduplicate them
+- report malformed Python, Cargo, Pipfile, and nested JavaScript manifests as
+  Error diagnostics and `outcome: "partial"`; malformed requirement lines are
+  Warnings. JavaScript-specific diagnostics are emitted only for JavaScript
+  projects
+- `pax deps` no longer reports `partial` merely because Python is present;
+  `pax lock` includes and selects Python component lockfiles
+- add `tests/fixtures/discovery/` and `tests/discovery.rs` covering valid,
+  malformed, and ambiguous Python, Cargo, nested JavaScript, and Compose
+  projects
 
 ## 0.4.1
 

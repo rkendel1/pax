@@ -85,10 +85,10 @@ treats it as success has lost the distinction this contract exists to preserve.
 | Command | `unsupported` when | `partial` when |
 | --- | --- | --- |
 | `info`, `doctor` | nothing supported was detected | an error-level diagnostic remains |
-| `deps` | only container components were detected | a Python component is present (dependency parsing is incomplete) |
+| `deps` | only container components were detected | an error-level diagnostic remains |
 | `scripts` | no JavaScript component was detected | more than one component is present |
 | `workspaces` | neither JavaScript nor Rust was detected | a Python component is present |
-| `lock` | no JavaScript, Rust, or Python component was detected | Python lockfiles exist but are not in the document yet |
+| `lock` | no JavaScript, Rust, or Python component was detected | multiple Python lockfiles leave no single selected lockfile, or an error-level diagnostic remains |
 | `graph`, `reality` | no component was detected | reality reports an `unknown` layer |
 | `drift` | no component was detected | a live/runtime issue is `unknown` |
 
@@ -175,6 +175,9 @@ Existing shapes are unchanged:
 - `graph` keeps per-edge `evidence` entries listing the files that established
   the edge.
 - `drift` keeps per-issue evidence with `source` and layer `kind`.
+- Every inspection `nativeDependencies[]` entry names its declaring
+  `source` (a project-relative manifest or requirements file). Graph edges use
+  the same file as evidence.
 
 ## Entity identities
 
@@ -211,6 +214,22 @@ These are intentional corrections, not silent behavior changes:
 5. **The command word is parsed, not searched.** `pax run drift` and
    `pax --dir drift info` no longer select drift exit-code semantics just because
    an argument is the word `drift`.
+6. **Python declarations are interpreted.** `pyproject.toml`, standalone and
+   nested requirements files, and `Pipfile` declarations name their source;
+   malformed manifests produce error diagnostics and `partial`, not invented
+   facts or an empty success. `pax deps` no longer reports `partial` merely
+   because a Python component exists.
+7. **Python lockfiles are inspectable.** `pax lock` includes Python component
+   lockfiles and selects the first when no JavaScript or Cargo lockfile exists.
+8. **Nested JavaScript manifests are components.** Every `package.json` is
+   discovered; nested declarations enter `nativeDependencies` with a
+   project-relative `source`, and graph edges are attributed to the declaring
+   component. Hoisted `node_modules/` satisfies nested install checks.
+9. **Compose services are structural.** Only direct children of `services:`
+   are services; nested keys such as `ports` and `environment` are not.
+10. **Pipenv is discovery-only.** `Pipfile` declarations are reported with
+    `tool: "pipenv"`, but pipenv operations fail with an explicit unsupported
+    error rather than guessing a command.
 
 ## Compatibility policy
 
@@ -252,7 +271,6 @@ schema, execution-result compatibility, and `pax run drift`.
 
 This contract does not:
 
-- fix Python dependency parsing or Docker/Compose parsing;
 - add new observers, resolution, or execution semantics;
 - make `reality` a verification system;
 - assign meaning to facts or decide what a consumer should do;

@@ -67,11 +67,18 @@ pax --version
 - package-manager and lockfile consistency
 - workspace configuration
 
-PAX also detects Python (`uv`, `pip`, Poetry, PDM), Rust (`cargo`), and Docker
-or Compose projects. `pax info --json` reports all detected components in a
-repository, including manifests, lockfiles, tool evidence, native dependency
-semantics, and static container services. Cargo projects use read-only,
-offline `cargo metadata --no-deps` for authoritative workspace semantics.
+PAX also detects Python (`uv`, `pip`, Poetry, PDM, pipenv), Rust (`cargo`), and
+Docker or Compose projects. `pax info --json` reports all detected components in
+a repository, including manifests, lockfiles, tool evidence, native dependency
+semantics, and static container services. Python declarations are read from
+`pyproject.toml` (`[project]`, optional dependency groups, `[dependency-groups]`,
+Poetry sections, and `[build-system].requires`), standalone `requirements*.txt`
+and `requirements/*.txt`, and `Pipfile`; every declaration names its source
+file. Pipenv is discovered but not executable, so pipenv operations fail with an
+explicit unsupported error. Every `package.json` is a component, including
+nested workspace and example manifests, and hoisted `node_modules/` installs are
+recognized. Cargo projects use read-only, offline `cargo metadata --no-deps` for
+authoritative workspace semantics, with a TOML fallback for workspace members.
 Inspection never invokes Node, Python, JavaScript/Python package managers, or
 the Docker daemon.
 
@@ -90,8 +97,8 @@ observations: which manifests exist (`declared`), which lockfiles exist
 repairs them. Static observation does not require network access or a Docker
 daemon.
 
-Known limitations (Python and Compose parsing, unparseable manifests, no
-runtime or tool detection) are listed in [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
+Known limitations (no runtime or tool detection, and no pipenv execution) are
+listed in [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
 
 `pax drift` uses exit code 0 for no drift, 1 for detected drift, and 2 for
 ambiguous observations. Invalid input uses exit code 2.
@@ -99,8 +106,10 @@ ambiguous observations. Invalid input uses exit code 2.
 `pax run <target> [args...]` delegates to the detected native tool without
 interpreting the target: JavaScript uses the selected package manager, Python
 uses `uv`, Poetry, PDM, or Python, Rust uses Cargo, and Compose uses Docker
-Compose. Standard input/output/error, environment, working directory, and the
-delegated process exit status are preserved.
+Compose. Pipenv projects are discovered but not executed; use an explicit
+`--tool` such as `uv` or `pip` after migrating. Standard
+input/output/error, environment, working directory, and the delegated process
+exit status are preserved.
 
 `pax build`, `pax test`, `pax lint`, and `pax typecheck` are first-class project
 operations. PAX resolves each operation once, reports why it selected the
