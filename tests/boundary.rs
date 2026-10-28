@@ -213,8 +213,9 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-// 7 + 8. Observation commands never execute tools, resolve dependencies, or write files,
-// including `--live` (which today runs nothing).
+// 7 + 8. Static observation commands never execute tools, resolve dependencies,
+// or write files. Runtime inspection is separately authorized by `--live` and is
+// covered by `tests/runtime.rs`.
 #[cfg(unix)]
 #[test]
 fn observation_commands_execute_no_tool_and_write_nothing() {
@@ -242,8 +243,6 @@ fn observation_commands_execute_no_tool_and_write_nothing() {
         &["--json", "graph"],
         &["--json", "observe"],
         &["--json", "reality"],
-        &["--json", "reality", "--live"],
-        &["--json", "drift", "--live"],
         &["--dry-run", "--json", "install"],
         &["--dry-run", "--json", "test"],
     ] {
@@ -270,15 +269,44 @@ fn observation_commands_execute_no_tool_and_write_nothing() {
     );
 }
 
-// `--live` claims a runtime layer but performs no runtime observation.
+// `--live` names the Docker/Compose commands it actually attempted. Without a
+// Docker CLI it reports a blocked observation, never `inspected`.
+#[cfg(unix)]
 #[test]
-fn known_limitation_live_names_a_command_it_never_runs() {
+fn live_without_docker_cli_is_blocked_not_claimed_as_inspection() {
     let root = temp_dir();
     container_project(&root);
-    let reality = json(&root, &["--json", "reality", "--live"]);
+    let empty = root.join("empty-bin");
+    fs::create_dir_all(&empty).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "reality", "--live"])
+        .current_dir(&root)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let reality: Value = serde_json::from_slice(&output.stdout).unwrap();
     let runtime = &reality["runtime"]["observations"][0];
-    assert_eq!(runtime["status"], "unknown");
-    assert_eq!(runtime["evidence"][0], "docker compose ps");
+    assert_eq!(runtime["status"], "blocked");
+    assert_eq!(runtime["source"], "environment");
+    assert_eq!(runtime["evidence"][0], "PATH");
+    assert_eq!(
+        reality["runtime"]["failure"],
+        "docker CLI not found on PATH"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["reality", "--live"])
+        .current_dir(&root)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("failure: docker CLI not found on PATH"),
+        "{text}"
+    );
+    assert!(!text.contains("RUNTIME\n  inspected"), "{text}");
 }
 
 // 10. Invalid metadata produces an explicit error, not invented observations.
@@ -457,16 +485,25 @@ fn known_limitation_info_embeds_the_absolute_project_root() {
 }
 
 // `unknown` evidence is never promoted to `drift` or to `ambiguous`.
+#[cfg(unix)]
 #[test]
 fn live_unknown_does_not_confirm_a_discrepancy() {
     let root = temp_dir();
     container_project(&root);
+    let empty = root.join("empty-bin");
+    fs::create_dir_all(&empty).unwrap();
     let static_drift = json(&root, &["--json", "drift"]);
     assert_eq!(static_drift["status"], "match");
-    let output = pax(&root, &["--json", "drift", "--live"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["--json", "drift", "--live"])
+        .current_dir(&root)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(0));
     let live: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(live["status"], "unknown");
     assert_eq!(live["outcome"], "partial");
     assert_eq!(live["issues"][0]["status"], "unknown");
+    assert_eq!(live["runtime"]["observations"][0]["status"], "blocked");
 }

@@ -190,7 +190,7 @@ collapsing them into one claim:
 | `declared` | the manifest names the dependency | that it was resolved or installed |
 | `lockfile` | the parsed lockfile package set records the dependency | that the installed tree matches it |
 | `installed` | a static installed-package directory contains it | that it is complete or runnable |
-| `runtime` | a runtime observer | currently `unknown`; static inspection performs no runtime observation |
+| `runtime` | a live runtime observer, authorized by `--live` | that the service is healthy, complete, or deployable |
 
 Each observation carries a `status` from the fact-state vocabulary. Lockfile
 observations additionally name the `format` (`npm`, `pnpm`, `yarn`, `bun`,
@@ -198,6 +198,53 @@ observations additionally name the `format` (`npm`, `pnpm`, `yarn`, `bun`,
 when the package set was actually established. A structurally empty,
 unparseable, or unrecognized lockfile reports `unknown` with a `detail`, never
 an empty successful package set.
+
+### Runtime observations
+
+Static inspection emits `runtime: { "observations": [] }` and runs no Docker.
+`pax reality --live` and `pax drift --live` authorize a bounded observation of
+detected container components:
+
+- the Docker CLI is located on `PATH`;
+- `docker info --format {{.ServerVersion}}` checks daemon accessibility;
+- `docker compose -f <file> ps --format json` (one bounded call per Compose
+  component) establishes service state.
+
+Both calls are bounded by a 5 second timeout. PAX does not start, stop, build,
+pull, or create containers.
+
+The runtime layer reports:
+
+| Field | Meaning |
+| --- | --- |
+| `scope` | project-relative Compose files inspected, or `no container components` / `container components without Compose files` |
+| `observedAt` | RFC 3339 UTC timestamp at the start of the runtime observation |
+| `permission` | the authorization that allowed the observation (`authorized (--live)`) |
+| `commands` | the exact command shapes attempted, in order |
+| `failure` | the first command or parse failure, if any |
+| `observations[]` | one fact per declared Compose service (or one component-level fact when no service can be scoped) |
+
+Runtime observation states are deliberately distinct:
+
+| State | Meaning |
+| --- | --- |
+| `present` | Compose reported the declared service running |
+| `absent` | the Compose command succeeded and the declared service is not running |
+| `blocked` | a prerequisite prevented observation: Docker CLI missing or daemon inaccessible |
+| `failed` | an inspection command failed, timed out, or returned unparseable output |
+| `unsupported` | the component has no Compose file to scope a runtime observation |
+| `unknown` | the Compose file declares no services, or Compose reported no state |
+
+Each runtime observation also carries `scope`, `evidence`, an optional
+`detail`, and an optional `failure`. `--live` on a project with no container
+components reports an empty runtime layer with scope `no container components`.
+
+For `pax drift`, `present` and `absent` are established observations and do not
+by themselves create a discrepancy: a Compose file declares services, not that
+they must be running. `blocked`, `failed`, `unsupported`, and `unknown` produce
+an `unknown` drift issue, so unavailable runtime evidence is never promoted to
+confirmed `drift`. `--live` is accepted only by `reality` and `drift`; other
+commands fail closed with exit code 2.
 
 `dependencies[]` in `pax reality` combines the layers per declaration:
 

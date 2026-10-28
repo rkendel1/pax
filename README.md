@@ -96,12 +96,22 @@ lockfile formats are parsed into package sets and report their `format` and
 `packageCount`; an unparseable, structurally empty, or unrecognized lockfile is
 `unknown`, not an empty success. `pax drift` reconciles those layers and never
 repairs them. It reports a confirmed discrepancy only when the evidence
-supports one; unknown evidence stays `unknown`. `--live` does not currently
-observe anything, so the `runtime` layer reports `unknown`. Static observation
+supports one; unknown evidence stays `unknown`. Static observation is read-only
+and runs no Docker. `pax reality --live` and `pax drift --live` authorize a
+bounded runtime observation of detected Compose components using
+`docker info --format {{.ServerVersion}}` and
+`docker compose -f <file> ps --format json`. The runtime layer reports the
+project-relative scope, an RFC 3339 UTC timestamp, the permission that
+authorized it (`--live`), the commands attempted, and any failure. A service
+that Compose reports as not running is `absent`; a missing Docker CLI, an
+inaccessible daemon, a failed command, or invalid Compose output is
+`blocked`/`failed`, never `absent`. Dockerfile-only components are
+`unsupported` because there is no Compose project to scope. Static observation
 does not require network access or a Docker daemon.
 
-Known limitations (no runtime or tool detection, and no pipenv execution) are
-listed in [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
+Known limitations (no non-Docker runtime observation, no runtime version
+requirements, and no pipenv execution) are listed in
+[docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
 
 `pax drift` uses exit code 0 for no drift, unknown evidence, or an unsupported
 observation; 1 for confirmed drift; and 2 for ambiguity. Invalid input uses
@@ -231,7 +241,7 @@ shell, container runtime, or deployment provider.
 | --- | --- | --- | --- | --- |
 | `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | Cargo metadata for Rust | project files and Cargo metadata |
 | `observe` | bounded structure observation | no | Cargo metadata (Cargo scopes) | manifests and Rust source; see [docs/PAX_OBSERVATION.md](docs/PAX_OBSERVATION.md) |
-| `graph`, `reality`, `drift` | native observation | no | Cargo metadata; runtime only with `--live` | manifests, parsed lockfile package sets, installed package names, runtime observations |
+| `graph`, `reality`, `drift` | native observation | no | Cargo metadata; `--live` authorizes bounded `docker info` and `docker compose ps` | manifests, parsed lockfile package sets, installed package names, runtime observations with scope, time, permission, command, and failure |
 | `build`, `test`, `lint`, `typecheck` | resolved project operation | depends on native tool | yes | detected or overridden tool |
 | `run`, `x`, `install`, `add`, `remove` | native delegation | install or mutation commands may | yes | detected or overridden tool |
 | `exec` | exact delegation | depends on supplied command | yes | user-supplied command |

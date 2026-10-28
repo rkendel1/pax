@@ -3,8 +3,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod contract;
 mod execution_result;
@@ -340,10 +343,34 @@ struct RealityObservation {
     package_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// Project-relative scope inspected for this fact. Runtime observations only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    /// The explicit failure that prevented this fact from being established.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct RealityLayer {
+    observations: Vec<RealityObservation>,
+}
+
+/// A runtime observation layer. Static inspection leaves every optional field
+/// empty and serializes only `observations`, preserving the existing shape.
+#[derive(Clone, Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeLayer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
     observations: Vec<RealityObservation>,
 }
 
@@ -382,7 +409,7 @@ struct RealityOutput {
     declared: RealityLayer,
     resolved: RealityLayer,
     installed: RealityLayer,
-    runtime: RealityLayer,
+    runtime: RuntimeLayer,
     dependencies: Vec<DependencyObservation>,
     cargo: Option<CargoObservation>,
 }
@@ -411,6 +438,8 @@ struct DriftOutput {
     live: bool,
     status: String,
     issues: Vec<DriftItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeLayer>,
     cargo: Option<CargoObservation>,
 }
 
@@ -558,6 +587,12 @@ where
     S: Into<String>,
 {
     let cli = parse_args(args)?;
+    if cli.live && !matches!(cli.command, CommandName::Reality | CommandName::Drift) {
+        return Err(CliError {
+            message: "--live applies only to `pax reality` and `pax drift`".to_string(),
+            exit_code: 2,
+        });
+    }
     if cli.json && !cli.dry_run && matches!(cli.command, CommandName::Test) {
         return execute_with_result(&cli, Operation::Test);
     }
@@ -1593,6 +1628,8 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
             format: None,
             package_count: None,
             detail: None,
+            scope: None,
+            failure: None,
         })
         .collect();
     let resolved: Vec<RealityObservation> = detection
@@ -1613,6 +1650,8 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
                         .established()
                         .then_some(observation.packages.len()),
                     detail: observation.detail,
+                    scope: None,
+                    failure: None,
                 }
             })
         })
@@ -1631,26 +1670,15 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
                 format: None,
                 package_count,
                 detail,
+                scope: None,
+                failure: None,
             }
         })
         .collect();
-    let runtime: Vec<RealityObservation> = if live {
-        detection
-            .components
-            .iter()
-            .filter(|component| component.ecosystem == Ecosystem::Container)
-            .map(|component| RealityObservation {
-                subject: component.path.clone(),
-                status: "unknown".to_string(),
-                source: "docker".to_string(),
-                evidence: vec!["docker compose ps".to_string()],
-                format: None,
-                package_count: None,
-                detail: Some("no runtime observation was performed".to_string()),
-            })
-            .collect()
+    let runtime = if live {
+        inspect_runtime(detection)
     } else {
-        Vec::new()
+        RuntimeLayer::default()
     };
     let mut dependencies = Vec::new();
     for component in &detection.components {
@@ -1695,7 +1723,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         .iter()
         .chain(resolved.iter())
         .chain(installed.iter())
-        .chain(runtime.iter())
+        .chain(runtime.observations.iter())
         .any(|observation| !matches!(observation.status.as_str(), "present" | "absent"));
     let dependency_undetermined = dependencies.iter().any(|dependency| {
         [
@@ -1729,9 +1757,7 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         installed: RealityLayer {
             observations: installed,
         },
-        runtime: RealityLayer {
-            observations: runtime,
-        },
+        runtime,
         dependencies,
         cargo: detection.cargo.clone(),
     }
@@ -2016,20 +2042,34 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
             }
         }
     }
-    if live {
-        for component in &detection.components {
-            if component.ecosystem == Ecosystem::Container {
-                issues.push(DriftItem {
-                    subject: component.path.clone(),
-                    status: "unknown".to_string(),
-                    expected: "declared runtime services".to_string(),
-                    actual: "runtime not established".to_string(),
-                    evidence: vec![DriftEvidence {
-                        source: "docker compose ps".to_string(),
-                        kind: "runtime".to_string(),
-                    }],
-                });
+    let runtime = live.then(|| inspect_runtime(detection));
+    if let Some(runtime) = &runtime {
+        for observation in &runtime.observations {
+            if matches!(observation.status.as_str(), "present" | "absent") {
+                continue;
             }
+            let actual = observation
+                .failure
+                .clone()
+                .or_else(|| observation.detail.clone())
+                .unwrap_or_else(|| format!("runtime state {}", observation.status));
+            push_drift_issue(
+                &mut issues,
+                DriftItem {
+                    subject: observation.subject.clone(),
+                    status: "unknown".to_string(),
+                    expected: "established runtime state".to_string(),
+                    actual,
+                    evidence: observation
+                        .evidence
+                        .iter()
+                        .map(|source| DriftEvidence {
+                            source: source.clone(),
+                            kind: "runtime".to_string(),
+                        })
+                        .collect(),
+                },
+            );
         }
     }
     issues.sort_by(|a, b| a.subject.cmp(&b.subject).then(a.status.cmp(&b.status)));
@@ -2062,8 +2102,612 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
             "match".to_string()
         },
         issues,
+        runtime,
         cargo: detection.cargo.clone(),
     }
+}
+
+fn is_compose_file_name(name: &str) -> bool {
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    matches!(
+        name,
+        "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml"
+    )
+}
+
+struct ComposeScope {
+    component: String,
+    directory: PathBuf,
+    /// Compose file names relative to the component directory, usable as `-f` values.
+    files: Vec<String>,
+    /// Compose file paths relative to the project root, for output and evidence.
+    display_files: Vec<String>,
+    /// Every manifest the component was detected from, relative to the project root.
+    manifests: Vec<String>,
+    services: Vec<String>,
+    read_failure: Option<String>,
+}
+
+fn collect_compose_scopes(detection: &RepositoryDetection) -> Vec<ComposeScope> {
+    detection
+        .components
+        .iter()
+        .filter(|component| component.ecosystem == Ecosystem::Container)
+        .map(|component| {
+            let directory = component_directory(detection, component);
+            let manifests = component
+                .manifests
+                .iter()
+                .map(|manifest| component_file(component, manifest))
+                .collect::<Vec<_>>();
+            let mut files = Vec::new();
+            let mut display_files = Vec::new();
+            let mut services = Vec::new();
+            let mut read_failure = None;
+            for manifest in &component.manifests {
+                if !is_compose_file_name(manifest) {
+                    continue;
+                }
+                files.push(manifest.clone());
+                let display = component_file(component, manifest);
+                display_files.push(display.clone());
+                match fs::read_to_string(directory.join(manifest)) {
+                    Ok(contents) => {
+                        let (declared, _) = parse_compose_file(&contents);
+                        for service in declared {
+                            if !services.contains(&service) {
+                                services.push(service);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if read_failure.is_none() {
+                            read_failure = Some(format!("could not read {display}: {error}"));
+                        }
+                    }
+                }
+            }
+            ComposeScope {
+                component: component.path.clone(),
+                directory,
+                files,
+                display_files,
+                manifests,
+                services,
+                read_failure,
+            }
+        })
+        .collect()
+}
+
+fn runtime_scope_label(scopes: &[ComposeScope]) -> String {
+    let files = scopes
+        .iter()
+        .flat_map(|scope| scope.display_files.iter().cloned())
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        if scopes.is_empty() {
+            "no container components".to_string()
+        } else {
+            "container components without Compose files".to_string()
+        }
+    } else {
+        format!("compose:{}", files.join(", "))
+    }
+}
+
+fn scope_for_observation(scope: &ComposeScope) -> String {
+    if scope.display_files.is_empty() {
+        scope.component.clone()
+    } else {
+        format!("compose:{}", scope.display_files.join(", "))
+    }
+}
+
+fn runtime_observation(
+    subject: String,
+    status: &str,
+    source: &str,
+    evidence: Vec<String>,
+    detail: Option<String>,
+    failure: Option<String>,
+    scope: Option<String>,
+) -> RealityObservation {
+    RealityObservation {
+        subject,
+        status: status.to_string(),
+        source: source.to_string(),
+        evidence,
+        format: None,
+        package_count: None,
+        detail,
+        scope,
+        failure,
+    }
+}
+
+fn compose_ps_args(files: &[String]) -> Vec<String> {
+    let mut args = vec!["compose".to_string()];
+    for file in files {
+        args.push("-f".to_string());
+        args.push(file.clone());
+    }
+    args.push("ps".to_string());
+    args.push("--format".to_string());
+    args.push("json".to_string());
+    args
+}
+
+fn compose_ps_command(files: &[String]) -> String {
+    let mut command = "docker compose".to_string();
+    for file in files {
+        command.push_str(" -f ");
+        command.push_str(file);
+    }
+    command.push_str(" ps --format json");
+    command
+}
+
+#[derive(Clone, Debug)]
+struct ComposeContainer {
+    service: String,
+    state: Option<String>,
+}
+
+impl ComposeContainer {
+    fn running(&self) -> bool {
+        self.state.as_deref().is_some_and(|state| {
+            let state = state.trim().to_ascii_lowercase();
+            state == "running" || state.starts_with("up ")
+        })
+    }
+
+    fn state_label(&self) -> String {
+        self.state
+            .as_deref()
+            .map(str::trim)
+            .filter(|state| !state.is_empty())
+            .unwrap_or("state not reported")
+            .to_string()
+    }
+}
+
+fn parse_compose_ps(contents: &str) -> Result<Vec<ComposeContainer>, String> {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::new();
+    if trimmed.starts_with('[') {
+        let array = serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
+            .map_err(|error| format!("expected a JSON array: {error}"))?;
+        values.extend(array);
+    } else {
+        for line in trimmed.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value = serde_json::from_str::<serde_json::Value>(line)
+                .map_err(|error| format!("expected one JSON object per line: {error}"))?;
+            match value {
+                serde_json::Value::Array(items) => values.extend(items),
+                value @ serde_json::Value::Object(_) => values.push(value),
+                _ => return Err("expected one JSON object per line".to_string()),
+            }
+        }
+    }
+    let mut containers = Vec::new();
+    for value in values {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let service = ["Service", "service"]
+            .iter()
+            .find_map(|name| object.get(*name).and_then(|value| value.as_str()));
+        let Some(service) = service else {
+            continue;
+        };
+        let state = ["State", "state", "Status", "status"]
+            .iter()
+            .find_map(|name| object.get(*name).and_then(|value| value.as_str()))
+            .map(str::to_string);
+        containers.push(ComposeContainer {
+            service: service.to_string(),
+            state,
+        });
+    }
+    Ok(containers)
+}
+
+struct BoundedOutput {
+    status: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn read_all(mut reader: impl Read) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = reader.read_to_end(&mut buffer);
+    buffer
+}
+
+fn run_bounded(
+    program: &Path,
+    args: &[String],
+    directory: &Path,
+    timeout: Duration,
+) -> Result<BoundedOutput, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout was not captured".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr was not captured".to_string())?;
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.to_string());
+            }
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().ok();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(BoundedOutput {
+        status: status.and_then(|status| status.code()),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+    })
+}
+
+fn describe_failure(output: &BoundedOutput) -> String {
+    if output.timed_out {
+        return "timed out".to_string();
+    }
+    let message = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    let first_line = message.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return match output.status {
+            Some(code) => format!("exit code {code}"),
+            None => "no exit status".to_string(),
+        };
+    }
+    first_line.chars().take(300).collect()
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let extensions = env::var_os("PATHEXT")
+                .unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".into())
+                .to_string_lossy()
+                .to_string();
+            for extension in extensions.split(';').filter(|value| !value.is_empty()) {
+                let candidate = directory.join(format!("{name}{extension}"));
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = (days - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn format_utc_timestamp(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = remainder / 3_600;
+    let minute = (remainder % 3_600) / 60;
+    let second = remainder % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn utc_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_utc_timestamp(seconds)
+}
+
+const RUNTIME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Observes Docker/Compose runtime state for detected container components.
+///
+/// This is only called when `--live` explicitly authorizes runtime inspection.
+/// The only commands run are bounded `docker info` and `docker compose ps`.
+fn inspect_runtime(detection: &RepositoryDetection) -> RuntimeLayer {
+    let scopes = collect_compose_scopes(detection);
+    let mut layer = RuntimeLayer {
+        scope: Some(runtime_scope_label(&scopes)),
+        observed_at: Some(utc_timestamp()),
+        permission: Some("authorized (--live)".to_string()),
+        commands: Vec::new(),
+        failure: None,
+        observations: Vec::new(),
+    };
+    if scopes.is_empty() {
+        return layer;
+    }
+
+    let Some(docker) = find_executable("docker") else {
+        let failure = "docker CLI not found on PATH".to_string();
+        layer.failure = Some(failure.clone());
+        for scope in &scopes {
+            layer.observations.push(runtime_observation(
+                scope.component.clone(),
+                "blocked",
+                "environment",
+                vec!["PATH".to_string()],
+                Some(failure.clone()),
+                Some(failure.clone()),
+                Some(scope_for_observation(scope)),
+            ));
+        }
+        return layer;
+    };
+
+    let info_args = vec![
+        "info".to_string(),
+        "--format".to_string(),
+        "{{.ServerVersion}}".to_string(),
+    ];
+    layer
+        .commands
+        .push("docker info --format {{.ServerVersion}}".to_string());
+    let info = run_bounded(&docker, &info_args, &detection.root, RUNTIME_TIMEOUT);
+    let daemon_failure = match &info {
+        Err(error) => Some(format!("could not start docker: {error}")),
+        Ok(output) if output.timed_out => Some(format!(
+            "docker info timed out after {}s",
+            RUNTIME_TIMEOUT.as_secs()
+        )),
+        Ok(output) if output.status != Some(0) => Some(format!(
+            "docker daemon inaccessible: {}",
+            describe_failure(output)
+        )),
+        Ok(_) => None,
+    };
+    if let Some(failure) = daemon_failure {
+        layer.failure = Some(failure.clone());
+        for scope in &scopes {
+            layer.observations.push(runtime_observation(
+                scope.component.clone(),
+                "blocked",
+                "docker",
+                vec!["docker info".to_string()],
+                Some(failure.clone()),
+                Some(failure.clone()),
+                Some(scope_for_observation(scope)),
+            ));
+        }
+        return layer;
+    }
+
+    for scope in &scopes {
+        let observation_scope = scope_for_observation(scope);
+        if scope.files.is_empty() {
+            layer.observations.push(runtime_observation(
+                scope.component.clone(),
+                "unsupported",
+                "docker",
+                scope.manifests.clone(),
+                Some(
+                    "runtime observation is scoped to Compose projects; no Compose file was found"
+                        .to_string(),
+                ),
+                None,
+                Some(observation_scope),
+            ));
+            continue;
+        }
+        if let Some(failure) = &scope.read_failure {
+            layer.failure.get_or_insert_with(|| failure.clone());
+            layer.observations.push(runtime_observation(
+                scope.component.clone(),
+                "failed",
+                "docker",
+                scope.display_files.clone(),
+                Some(failure.clone()),
+                Some(failure.clone()),
+                Some(observation_scope),
+            ));
+            continue;
+        }
+        if scope.services.is_empty() {
+            layer.observations.push(runtime_observation(
+                scope.component.clone(),
+                "unknown",
+                "docker",
+                scope.display_files.clone(),
+                Some("Compose file declares no services".to_string()),
+                None,
+                Some(observation_scope),
+            ));
+            continue;
+        }
+
+        let command = compose_ps_command(&scope.files);
+        layer.commands.push(command);
+        let args = compose_ps_args(&scope.files);
+        match run_bounded(&docker, &args, &scope.directory, RUNTIME_TIMEOUT) {
+            Err(error) => {
+                let failure = format!("could not start docker compose ps: {error}");
+                layer.failure.get_or_insert_with(|| failure.clone());
+                layer.observations.push(runtime_observation(
+                    scope.component.clone(),
+                    "failed",
+                    "docker",
+                    scope.display_files.clone(),
+                    Some(failure.clone()),
+                    Some(failure),
+                    Some(observation_scope),
+                ));
+            }
+            Ok(output) if output.timed_out => {
+                let failure = format!(
+                    "docker compose ps timed out after {}s",
+                    RUNTIME_TIMEOUT.as_secs()
+                );
+                layer.failure.get_or_insert_with(|| failure.clone());
+                layer.observations.push(runtime_observation(
+                    scope.component.clone(),
+                    "failed",
+                    "docker",
+                    scope.display_files.clone(),
+                    Some(failure.clone()),
+                    Some(failure),
+                    Some(observation_scope),
+                ));
+            }
+            Ok(output) if output.status != Some(0) => {
+                let failure = format!("docker compose ps failed: {}", describe_failure(&output));
+                layer.failure.get_or_insert_with(|| failure.clone());
+                layer.observations.push(runtime_observation(
+                    scope.component.clone(),
+                    "failed",
+                    "docker",
+                    scope.display_files.clone(),
+                    Some(failure.clone()),
+                    Some(failure),
+                    Some(observation_scope),
+                ));
+            }
+            Ok(output) => match parse_compose_ps(&output.stdout) {
+                Err(error) => {
+                    let failure = format!("could not parse docker compose ps output: {error}");
+                    layer.failure.get_or_insert_with(|| failure.clone());
+                    layer.observations.push(runtime_observation(
+                        scope.component.clone(),
+                        "failed",
+                        "docker",
+                        scope.display_files.clone(),
+                        Some(failure.clone()),
+                        Some(failure),
+                        Some(observation_scope),
+                    ));
+                }
+                Ok(containers) => {
+                    for service in &scope.services {
+                        let subject = dependency_subject(
+                            detection
+                                .components
+                                .iter()
+                                .find(|component| component.path == scope.component)
+                                .expect("scope belongs to a detected component"),
+                            service,
+                        );
+                        let container = containers
+                            .iter()
+                            .find(|container| container.service == *service);
+                        let (status, detail) = match container {
+                            Some(container) if container.running() => {
+                                let label = container.state_label();
+                                let detail = if label.eq_ignore_ascii_case("running") {
+                                    "running".to_string()
+                                } else {
+                                    format!("running ({label})")
+                                };
+                                ("present", Some(detail))
+                            }
+                            Some(container) if container.state.is_none() => {
+                                ("unknown", Some("Compose reported no state".to_string()))
+                            }
+                            Some(container) => (
+                                "absent",
+                                Some(format!("not running ({})", container.state_label())),
+                            ),
+                            None => ("absent", Some("not running".to_string())),
+                        };
+                        layer.observations.push(runtime_observation(
+                            subject,
+                            status,
+                            "docker",
+                            scope.display_files.clone(),
+                            detail,
+                            None,
+                            Some(observation_scope.clone()),
+                        ));
+                    }
+                }
+            },
+        }
+    }
+    layer
 }
 
 fn render_graph(output: &GraphOutput) -> String {
@@ -2084,39 +2728,83 @@ fn render_graph(output: &GraphOutput) -> String {
     lines.join("\n")
 }
 
+fn render_runtime(layer: &RuntimeLayer, live: bool) -> Vec<String> {
+    if !live {
+        return vec![
+            "RUNTIME".to_string(),
+            "  not inspected (pass --live to authorize Docker/Compose observation)".to_string(),
+        ];
+    }
+    let mut lines = vec!["RUNTIME".to_string()];
+    let mut metadata = Vec::new();
+    if let Some(scope) = &layer.scope {
+        metadata.push(format!("scope {scope}"));
+    }
+    if let Some(observed_at) = &layer.observed_at {
+        metadata.push(format!("observed {observed_at}"));
+    }
+    if let Some(permission) = &layer.permission {
+        metadata.push(format!("permission {permission}"));
+    }
+    if !metadata.is_empty() {
+        lines.push(format!("  {}", metadata.join(", ")));
+    }
+    if let Some(failure) = &layer.failure {
+        lines.push(format!("  failure: {failure}"));
+    }
+    if !layer.commands.is_empty() {
+        lines.push(format!("  commands: {}", layer.commands.join("; ")));
+    }
+    if layer.observations.is_empty() {
+        lines.push("  no container components to inspect".to_string());
+    }
+    lines.extend(layer.observations.iter().map(|observation| {
+        let detail = observation
+            .detail
+            .as_deref()
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        format!(
+            "  {}: {}{}",
+            observation.subject, observation.status, detail
+        )
+    }));
+    lines
+}
+
 fn render_reality(output: &RealityOutput) -> String {
     let count = |layer: &RealityLayer| layer.observations.len();
-    format!(
-        "PROJECT\n  {} components\nDECLARED\n  {}\nRESOLVED\n  {}\nINSTALLED\n  {}\nRUNTIME\n  {}",
-        count(&output.declared),
-        count(&output.declared),
-        count(&output.resolved),
-        count(&output.installed),
-        if output.live {
-            "inspected"
-        } else {
-            "not inspected"
-        }
-    )
+    let mut lines = vec![
+        format!("PROJECT\n  {} components", count(&output.declared)),
+        format!("DECLARED\n  {}", count(&output.declared)),
+        format!("RESOLVED\n  {}", count(&output.resolved)),
+        format!("INSTALLED\n  {}", count(&output.installed)),
+    ];
+    lines.extend(render_runtime(&output.runtime, output.live));
+    lines.join("\n")
 }
 
 fn render_drift(output: &DriftOutput) -> String {
-    if output.issues.is_empty() {
-        return "NO DRIFT".to_string();
-    }
     let mut lines = Vec::new();
-    match output.status.as_str() {
-        "unknown" => lines.push("UNKNOWN".to_string()),
-        "ambiguous" => lines.push("AMBIGUOUS".to_string()),
-        _ => {}
+    if output.issues.is_empty() {
+        lines.push("NO DRIFT".to_string());
+    } else {
+        match output.status.as_str() {
+            "unknown" => lines.push("UNKNOWN".to_string()),
+            "ambiguous" => lines.push("AMBIGUOUS".to_string()),
+            _ => {}
+        }
+        lines.push(format!("{} issues", output.issues.len()));
+        lines.extend(
+            output
+                .issues
+                .iter()
+                .map(|issue| format!("  {}\n    {}", issue.subject, issue.actual)),
+        );
     }
-    lines.push(format!("{} issues", output.issues.len()));
-    lines.extend(
-        output
-            .issues
-            .iter()
-            .map(|issue| format!("  {}\n    {}", issue.subject, issue.actual)),
-    );
+    if let Some(runtime) = &output.runtime {
+        lines.extend(render_runtime(runtime, true));
+    }
     lines.join("\n")
 }
 
@@ -5462,6 +6150,38 @@ mod tests {
         );
         assert_eq!(services, vec!["web", "db"]);
         assert_eq!(images, vec!["nginx:1", "postgres:16"]);
+    }
+
+    #[test]
+    fn runtime_timestamps_are_rfc3339_utc() {
+        assert_eq!(format_utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc_timestamp(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(format_utc_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn compose_ps_parses_arrays_and_json_lines() {
+        let array = parse_compose_ps(
+            r#"[{"Service":"web","State":"running"},{"Service":"db","State":"exited"}]"#,
+        )
+        .unwrap();
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0].service, "web");
+        assert!(array[0].running());
+        assert_eq!(array[1].service, "db");
+        assert!(!array[1].running());
+        assert_eq!(array[1].state_label(), "exited");
+
+        let lines = parse_compose_ps(
+            "{\"Service\":\"web\",\"Status\":\"Up 2 minutes\"}\n{\"service\":\"db\",\"status\":\"exited\"}\n",
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].running());
+        assert!(!lines[1].running());
+        assert!(parse_compose_ps("[]").unwrap().is_empty());
+        assert!(parse_compose_ps("").unwrap().is_empty());
+        assert!(parse_compose_ps("not json").is_err());
     }
 
     #[test]

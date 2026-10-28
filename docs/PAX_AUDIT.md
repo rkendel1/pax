@@ -26,10 +26,11 @@ lockfiles, reports declared dependencies and scripts (accurately for
 parses recognized lockfile package sets, enumerates package names in
 conventional install directories, selects a native tool deterministically, and
 can run that tool and, for Cargo tests, state what the result means. It does not
-resolve dependencies, probe the host, run workloads on its own authority, or
-know anything about runtime versions. Its `reality` vocabulary describes
-layered evidence, not verified reality, and the `--live` `runtime` field claims
-more than it does.
+resolve dependencies, probe host toolchains, run workloads on its own authority,
+or know anything about Node, Python, or Rust runtime versions. Its `reality`
+vocabulary describes layered evidence, not verified reality. `--live` now
+performs a bounded, read-only Docker/Compose observation; it reports absence
+separately from unavailable or failed runtime evidence.
 
 ## What PAX actually does
 
@@ -46,22 +47,23 @@ Inventory (all verified in code; "Det." = deterministic given identical files):
 | Dependency graph | yes (declared edges only) | `build_graph` | `nodes`, `edges`, `evidence` | yes (sorted) | none | `graph_json_preserves…` |
 | "Reality" layers | partial | `build_reality` (field table below); `src/lockfile.rs` parses recognized lockfiles | 4 layers + `dependencies[]` | yes | none | `reality_json_is_static…`, `tests/reconciliation.rs` |
 | Drift | partial | `build_drift`; reconciles parsed lockfile package sets and installed package names | `status`, `issues[]` | yes | none | `drift_json_reports_conflicts…`, `malformed_lockfile_is_unknown…` |
-| `--live` | not implemented | no process is started; `runtime` entries carry `status: "unknown"` | see below | yes | none | `known_limitation_live_*` |
+| `--live` | yes (Docker/Compose only) | `inspect_runtime`: `docker info`, `docker compose -f … ps --format json`, bounded by a 5s timeout; reports scope, timestamp, permission, commands, failures | `runtime{}` in `reality`/`drift` | no (clock, daemon) | `docker` on `PATH` and a reachable daemon | `tests/runtime.rs` |
 | Host tool/runtime detection | not implemented | `detect_node_runtime()` is `fn … { None }` | `result.runtime: null` | — | — | pinned |
 | Tool selection for operations | yes | `resolve_operation`, `selection_ambiguity` (fail-closed) | plan / exit 2 | yes | none | many |
 | Dry-run plan | yes | `execution_plan` | plan JSON (no schema field) | yes | none | several |
 | Native delegation | yes | `dispatch_execution`, `Command::new(program)` | native stdio, exit code | no (native) | native tool | several |
 | Test result interpretation | yes (Cargo only) | `execution_result.rs` | `pax.execution-result.v1` | yes given same native result | `cargo` | 12 integration + 7 unit |
-| Timestamps / observer identity | not implemented | no clock use outside tests | — | — | — | `structured_output_is_versioned…` |
+| Timestamps / observer identity | runtime only | `--live` records `runtime.observedAt` (RFC 3339 UTC); static observation has no clock-derived fields | `runtime.observedAt` | — | — | `tests/runtime.rs`, `structured_output_is_versioned…` |
 
-Process execution in the whole crate: `Command::new` appears three times —
-`cargo metadata` (inspection), `dispatch_execution` and `run_native`
-(delegation). Environment variables are never read (`env::var` is absent;
-`env::current_dir` is the only environment access). There is no network code.
+Process execution in the whole crate: `Command::new` is used for `cargo
+metadata` (inspection), the bounded `--live` Docker runner, `dispatch_execution`
+(delegation), and the execution-result runner. Static observation reads no
+environment variables; `--live` reads `PATH` to locate `docker`, and
+`env::current_dir` is used for project resolution. There is no network code.
 
 ## What PAX observes
 
-Directly, at invocation time, with no timestamp recorded:
+Static observation, directly at invocation time, with no timestamp recorded:
 
 - existence of: `package.json`, `package-lock.json`, `pnpm-lock.yaml`,
   `yarn.lock`, `bun.lock(b)`, `pnpm-workspace.yaml`, `pyproject.toml`,
@@ -128,9 +130,12 @@ these things.
 
 ## The "reality" model, field by field
 
-Layered semantics for `pax --json reality` (`build_reality`). All fields are
-project-local or machine-local filesystem state at invocation; none carries a
+Layered semantics for `pax --json reality` (`build_reality`). Static fields are
+project-local or machine-local filesystem state at invocation and carry no
 timestamp, so staleness is unbounded; evidence is a list of relative paths.
+The `runtime` layer is the exception: it is only populated under `--live`, and
+then reports its own scope, RFC 3339 UTC observation time, permission,
+attempted commands, and failures.
 
 | Field | Meaning | Source | Obs./Deriv. | Evidence | Staleness | If it says true/present, PAX has proven |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -143,7 +148,7 @@ timestamp, so staleness is unbounded; evidence is a list of relative paths.
 | `resolved.observations[].status` | one per lockfile: `present` when the recognized format parsed, `unknown` when structurally empty/unparseable/unrecognized, `failed` on read error | filesystem + parsed contents (`src/lockfile.rs`) | observation | lockfile path; `format`; `packageCount` when established; `detail` when not | until files change | the recorded dependency set was established. Not that it matches the manifest, is complete, or is installed |
 | `installed.observations[].status` | JS: `present`/`absent` from enumerated package names in `node_modules/`; Rust/Container: always `unknown`; Python: `present`/`absent` when `site-packages/` was enumerated, `unknown` when no conventional environment exists | filesystem | observation | directory name + `packageCount` | until files change | package names exist in that directory. Not versions, completeness, or lockfile agreement |
 | `dependencies[]` | one entry per declaration with separate `declared`, `lockfile`, `installed`, and optional `runtime` facts | manifest + lockfile + installed directories | observation/derivation | each fact's `source`/`evidence` | until files change | each layer independently; no layer implies another |
-| `runtime.observations[]` | empty unless `--live`; with `--live`, one per Container component, `status: "unknown"`, `source: "docker"`, `evidence: ["docker compose ps"]` | constant | **none: no observation occurs** | names a command PAX did not run | — | nothing. The `evidence` string is a statement of intent, not evidence |
+| `runtime` | `{ "observations": [] }` unless `--live`. With `--live`: `scope`, `observedAt` (RFC 3339 UTC), `permission: "authorized (--live)"`, attempted `commands`, optional `failure`, and one observation per declared Compose service | bounded `docker info --format {{.ServerVersion}}` and `docker compose -f <file> ps --format json` (5s timeout each), plus the parsed Compose file | observation (external tool) | Compose file path; per-observation `scope` and optional `failure` | the observation time is recorded; state is stale immediately after | `present` means Compose reported the service running; `absent` means the Compose inspection succeeded and the service was not running. `blocked`, `failed`, `unsupported`, and `unknown` establish nothing |
 | `cargo` | Cargo packages, members, dependencies, lockfile | `cargo metadata --no-deps --offline` or heuristic fallback | observation (external tool) / heuristic | `source` field names the method | until files change | Cargo reported these packages. `--no-deps` means dependency *resolution* is not observed |
 
 `drift` (`build_drift`): `issues[].status` is `drift`, `ambiguous`, or
@@ -153,6 +158,9 @@ precedence is `drift` > `ambiguous` > `unknown` > `match` (`unsupported` when
 nothing was detected). Exit codes are `1` for `drift`, `2` for `ambiguous`, and
 `0` for `match`, `unknown`, and `unsupported`; text mode prints `UNKNOWN` or
 `AMBIGUOUS` so evidence gaps are not confused with confirmed contradictions.
+`drift --live` adds a `runtime` layer with the same shape as `reality`; runtime
+`present`/`absent` are established and do not by themselves create an issue,
+while `blocked`/`failed`/`unsupported`/`unknown` produce an `unknown` issue.
 A JS component without `node_modules/` reports `drift` only when it declares at
 least one runtime dependency.
 
@@ -302,8 +310,8 @@ without marking which is which.
 | --- | --- | --- |
 | README line 3 | "the universal, read-only project-tooling boundary" | four ecosystems; not read-only as a whole (README line 8 concedes delegation) |
 | README | "`pax info` reports detected package-manager reality" | reports selection from a field/lockfile |
-| README | "runtime inspection is opt-in with `--live`" | `--live` inspects nothing |
-| README | "`pax reality` separates declared, resolved, installed, and runtime observations" | Fixed: each dependency layer carries its own state, source, and evidence; runtime remains `unknown` under `--live` |
+| README | "runtime inspection is opt-in with `--live`" | Fixed: `--live` performs a bounded, read-only Docker/Compose observation of detected Compose services and reports scope, time, permission, commands, and failures |
+| README | "`pax reality` separates declared, resolved, installed, and runtime observations" | Fixed: each dependency layer carries its own state, source, and evidence; the runtime layer reports observed service state or an explicit unavailable/unsupported/failed state |
 | README | "Cargo projects use … `cargo metadata --no-deps` for authoritative workspace semantics" | true when cargo succeeds; TOML fallback otherwise (provenance names the fallback) |
 | README | "native dependency semantics, and static container services" | accurate for Python TOML, requirements, Pipfile, nested `package.json`, and direct Compose services; unknown constructs are diagnosed |
 | README | "`pax drift` reports contradictions between those layers" | Fixed: reconciles parsed lockfile package sets and enumerated installed packages; unknown evidence is not a contradiction |
@@ -331,8 +339,12 @@ whose identifiers must not be joined across edge kinds without inspecting them.
 
 ## Product gaps (PAX-owned, prioritized)
 
-1. **P0** Stop `--live` and `runtime` from implying observation (remove the
-   claim, or implement a real observation with a recorded command and result).
+1. **P0** ~~Stop `--live` and `runtime` from implying observation (remove the
+   claim, or implement a real observation with a recorded command and result).~~
+   Fixed in 0.5.0: `--live` runs bounded `docker info` and `docker compose ps`,
+   and reports scope, timestamp, permission, attempted commands, and failures.
+   Missing CLI, inaccessible daemon, command failure, and absence are distinct
+   states (`tests/runtime.rs`).
 2. **P0** ~~Fix or fence the Python parser~~ Fixed in 0.5.0: real TOML parse,
    independent `requirements*.txt` discovery, Pipfile declarations, and
    explicit `partial` outcomes for malformed manifests.
@@ -377,7 +389,8 @@ whose identifiers must not be joined across edge kinds without inspecting them.
 **Do now**
 
 - Land this audit and the README corrections.
-- Fix P0 items (they are bugs, not features): `--live` claim, Python parser.
+- ~~Fix P0 items (they are bugs, not features): `--live` claim, Python parser.~~
+  Both P0 items are fixed in 0.5.0.
 - Add a compatibility policy for `schemaVersion: "1"` before changing values.
 - Compute (separate PR): refuse JS workspaces explicitly, or document precisely
   that they are not honored.

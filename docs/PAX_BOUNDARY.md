@@ -28,7 +28,7 @@ workloads on its own authority, and it does not know whether a project works.
 | **Claim** | A statement in PAX output. It is only as strong as the observation or derivation behind it, and should carry the files it came from. | `installed: present` |
 | **Declared** | Stated by a project file, not checked against anything. | `dependencies` in `package.json`. |
 | **Observed** | Seen on this machine now. | a directory exists. |
-| **Reality** | Reserved. PAX output may be called *reality* only if it states what was observed, where, when, how it was derived, declared vs. observed, and what is uncertain. **No PAX output meets this bar today**: nothing is timestamped, and installed/runtime layers remain partly unestablished. The command and field names `reality`, `resolved`, and `installed` are retained for compatibility; read them as "layered dependency and presence observations". |
+| **Reality** | Reserved. PAX output may be called *reality* only if it states what was observed, where, when, how it was derived, declared vs. observed, and what is uncertain. Static output still has no timestamp and several static layers remain partly unestablished; `--live` runtime observations add a scope, RFC 3339 UTC timestamp, permission, attempted commands, and failures. No PAX document yet meets the full bar. The command and field names `reality`, `resolved`, and `installed` are retained for compatibility; read them as "layered dependency and presence observations". |
 
 ## Diagram
 
@@ -80,10 +80,13 @@ Two discrepancies with this picture exist today and are documented, not fixed:
 ## Boundary rules
 
 1. **Observation commands are read-only.** `info`, `doctor`, `deps`, `scripts`,
-   `workspaces`, `lock`, `graph`, `observe`, `reality`, `drift` (with or without `--live`)
-   run no package manager, runtime, or Docker, and write no files. The only
-   process they start is `cargo metadata --no-deps --offline` for projects with a
-   `Cargo.toml`. Enforced by `tests/boundary.rs`.
+   `workspaces`, `lock`, `graph`, `observe`, `reality`, and `drift` write no
+   files. Static observation runs no package manager or Docker; the only
+   process it starts is `cargo metadata --no-deps --offline` for projects with a
+   `Cargo.toml`. `reality --live` and `drift --live` additionally authorize
+   bounded, read-only `docker info` and `docker compose ps` for detected Compose
+   components. They do not start, stop, build, pull, or create containers.
+   Enforced by `tests/boundary.rs` and `tests/runtime.rs`.
 2. **Delegation commands run the native tool as the user would**, preserve its
    exit status, and may mutate the project exactly as that tool does. PAX adds
    tool selection (fail-closed on ambiguity) and, for `--json test`, an
@@ -105,7 +108,7 @@ Two discrepancies with this picture exist today and are documented, not fixed:
 | Dependency resolution | PAX reads declared specifiers, parses recognized lockfile package sets, enumerates installed package names, and uses Cargo's own metadata. It does not solve versions or decide whether a lockfile is satisfiable; an unparseable or unrecognized lockfile is `unknown`, never an empty successful set. | `build_drift`, `src/lockfile.rs`, `detect_cargo` |
 | Environment management | PAX creates no virtualenv, `node_modules`, toolchain, or container. It enumerates packages in conventional directories, and reports `unknown` where no conventional environment exists. | `build_reality` |
 | Deployment | `deploy` delegates to `fly`/`vercel`/`netlify` selected from config-file evidence. PAX does not deploy on its own and says nothing about deployability. | `select_deploy_provider` |
-| Runtime management | PAX does not install, select, or probe Node, Python, or Rust versions. `doctor`'s `runtime` field is always `null`. | `detect_node_runtime` |
+| Runtime management | PAX does not install, select, or probe Node, Python, or Rust versions. `doctor`'s `runtime` field is always `null`. With `--live`, PAX observes whether detected Compose services are running; it does not create, start, stop, or configure containers. | `detect_node_runtime`, `inspect_runtime` |
 | Security / provenance | PAX output is not provenance. A tool selected by name is not verified (no path, hash, or signature is recorded). | no such code exists |
 | Application semantics | Outside `pax observe`, PAX does not read source code; it reads manifests. `pax observe` parses Rust source for structure only (modules, declaration names and locations) and assigns no meaning to it. See [PAX_OBSERVATION.md](PAX_OBSERVATION.md). | `detect_*`, `src/observe.rs` |
 | Business semantics | Out of scope. | — |

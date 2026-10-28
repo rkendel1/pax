@@ -43,7 +43,7 @@ fn main() -> ExitCode {
                     serde_json::from_str::<serde_json::Value>(&output)
                         .ok()
                         .and_then(|value| value["status"].as_str().map(str::to_string))
-                } else if output == "NO DRIFT" {
+                } else if output.starts_with("NO DRIFT") {
                     Some("match".to_string())
                 } else if output.starts_with("UNKNOWN") {
                     Some("unknown".to_string())
