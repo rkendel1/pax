@@ -88,20 +88,24 @@ state. All commands support `--json`; PAX does not install, resolve, or mutate
 dependencies while inspecting a project.
 
 `pax graph` reports the declared dependency and workspace relationships with
-ecosystem-specific types and evidence. `pax reality` reports layered *presence*
-observations: which manifests exist (`declared`), which lockfiles exist
-(`resolved`), whether conventional install directories exist (`installed`), and
-`runtime`. It does not read lockfile contents or check installed packages, and
-`--live` does not currently observe anything: the `runtime` layer reports
-`unknown`. `pax drift` reports contradictions between those layers and never
-repairs them. Static observation does not require network access or a Docker
-daemon.
+ecosystem-specific types and evidence. `pax reality` reports dependency
+evidence in separate layers: what each manifest declares (`declared`), what a
+recognized lockfile records (`resolved`), which package names are present in
+conventional install directories (`installed`), and `runtime`. Recognized
+lockfile formats are parsed into package sets and report their `format` and
+`packageCount`; an unparseable, structurally empty, or unrecognized lockfile is
+`unknown`, not an empty success. `pax drift` reconciles those layers and never
+repairs them. It reports a confirmed discrepancy only when the evidence
+supports one; unknown evidence stays `unknown`. `--live` does not currently
+observe anything, so the `runtime` layer reports `unknown`. Static observation
+does not require network access or a Docker daemon.
 
 Known limitations (no runtime or tool detection, and no pipenv execution) are
 listed in [docs/PAX_AUDIT.md](docs/PAX_AUDIT.md).
 
-`pax drift` uses exit code 0 for no drift, 1 for detected drift, and 2 for
-ambiguous observations. Invalid input uses exit code 2.
+`pax drift` uses exit code 0 for no drift, unknown evidence, or an unsupported
+observation; 1 for confirmed drift; and 2 for ambiguity. Invalid input uses
+exit code 2.
 
 `pax run <target> [args...]` delegates to the detected native tool without
 interpreting the target: JavaScript uses the selected package manager, Python
@@ -227,7 +231,7 @@ shell, container runtime, or deployment provider.
 | --- | --- | --- | --- | --- |
 | `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | native inspection | no | Cargo metadata for Rust | project files and Cargo metadata |
 | `observe` | bounded structure observation | no | Cargo metadata (Cargo scopes) | manifests and Rust source; see [docs/PAX_OBSERVATION.md](docs/PAX_OBSERVATION.md) |
-| `graph`, `reality`, `drift` | native observation | no | Cargo metadata; runtime only with `--live` | manifests, locks, installed/runtime observations |
+| `graph`, `reality`, `drift` | native observation | no | Cargo metadata; runtime only with `--live` | manifests, parsed lockfile package sets, installed package names, runtime observations |
 | `build`, `test`, `lint`, `typecheck` | resolved project operation | depends on native tool | yes | detected or overridden tool |
 | `run`, `x`, `install`, `add`, `remove` | native delegation | install or mutation commands may | yes | detected or overridden tool |
 | `exec` | exact delegation | depends on supplied command | yes | user-supplied command |
@@ -262,7 +266,7 @@ The legacy numeric version (`schemaVersion` or `schema_version`, currently
 `"1"`) is retained for existing consumers. `pax.observation.v1` and
 `pax.execution-result.v1` keep their existing fields and semantics; new fields
 are additive. Drift keeps its subject-level `status` (`match`, `drift`,
-`ambiguous`, or `unsupported`) alongside `outcome`.
+`ambiguous`, `unknown`, or `unsupported`) alongside `outcome`.
 
 See [docs/PAX_CONTRACT.md](docs/PAX_CONTRACT.md) for the full contract,
 compatibility policy, and intentional corrections.

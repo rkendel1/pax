@@ -8,6 +8,7 @@ use std::process::Command;
 
 pub mod contract;
 mod execution_result;
+mod lockfile;
 mod observe;
 use contract::{LEGACY_SCHEMA_VERSION, Outcome, inspection_schema, project_relative_path};
 use execution_result::execute_with_result;
@@ -327,16 +328,48 @@ struct GraphOutput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RealityObservation {
     subject: String,
     status: String,
     source: String,
     evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct RealityLayer {
     observations: Vec<RealityObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyFact {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyObservation {
+    name: String,
+    specifier: String,
+    kind: String,
+    ecosystem: Ecosystem,
+    component: String,
+    declared: DependencyFact,
+    lockfile: DependencyFact,
+    installed: DependencyFact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<DependencyFact>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -350,6 +383,7 @@ struct RealityOutput {
     resolved: RealityLayer,
     installed: RealityLayer,
     runtime: RealityLayer,
+    dependencies: Vec<DependencyObservation>,
     cargo: Option<CargoObservation>,
 }
 
@@ -937,6 +971,612 @@ fn javascript_node_modules(
     }
 }
 
+fn component_directory(detection: &RepositoryDetection, component: &Component) -> PathBuf {
+    if component.path == "." {
+        detection.root.clone()
+    } else {
+        detection.root.join(&component.path)
+    }
+}
+
+fn component_file(component: &Component, file: &str) -> String {
+    join_project_path(&component.path, file)
+}
+
+/// Returns the lockfiles that govern a component, walking ancestors for
+/// workspace ecosystems so a nested package uses the workspace-root lockfile.
+fn effective_component_lockfiles(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> Vec<String> {
+    let names: &[&str] = match component.ecosystem {
+        Ecosystem::JavaScript => &JAVASCRIPT_LOCKFILES,
+        Ecosystem::Rust => &["Cargo.lock"],
+        _ => return component.lockfiles.clone(),
+    };
+    let mut directory = component_directory(detection, component);
+    loop {
+        let files = names
+            .iter()
+            .filter(|name| directory.join(name).is_file())
+            .map(|name| {
+                directory
+                    .strip_prefix(&detection.root)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .filter(|relative| !relative.is_empty())
+                    .map_or_else(
+                        || (*name).to_string(),
+                        |relative| format!("{relative}/{name}"),
+                    )
+            })
+            .collect::<Vec<_>>();
+        if !files.is_empty() {
+            return files;
+        }
+        if directory == detection.root {
+            return Vec::new();
+        }
+        let Some(parent) = directory.parent() else {
+            return Vec::new();
+        };
+        if !parent.starts_with(&detection.root) {
+            return Vec::new();
+        }
+        directory = parent.to_path_buf();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LockfileSelection {
+    files: Vec<String>,
+    selected: Option<(String, lockfile::Observation)>,
+    ambiguous: bool,
+    detail: Option<String>,
+}
+
+impl LockfileSelection {
+    fn dependency_fact(&self, ecosystem: Ecosystem, name: &str) -> DependencyFact {
+        if let Some((source, observation)) = &self.selected {
+            let present = lockfile_contains(ecosystem, &observation.packages, name);
+            return DependencyFact {
+                status: if present { "present" } else { "absent" }.to_string(),
+                source: Some(source.clone()),
+                evidence: vec![source.clone()],
+                detail: None,
+            };
+        }
+        if self.files.is_empty() {
+            return DependencyFact {
+                status: "absent".to_string(),
+                source: None,
+                evidence: Vec::new(),
+                detail: Some("no lockfile recorded".to_string()),
+            };
+        }
+        DependencyFact {
+            status: "unknown".to_string(),
+            source: self.files.first().cloned(),
+            evidence: self.files.clone(),
+            detail: self.detail.clone(),
+        }
+    }
+}
+
+fn select_component_lockfile(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> LockfileSelection {
+    let files = effective_component_lockfiles(detection, component);
+    if files.is_empty() {
+        return LockfileSelection {
+            files,
+            selected: None,
+            ambiguous: false,
+            detail: None,
+        };
+    }
+    if component.ecosystem == Ecosystem::JavaScript {
+        let managers = files
+            .iter()
+            .filter_map(|file| manager_from_lockfile(file))
+            .collect::<std::collections::BTreeSet<_>>();
+        if managers.len() > 1 {
+            return LockfileSelection {
+                files,
+                selected: None,
+                ambiguous: true,
+                detail: Some("multiple package-manager lockfiles".to_string()),
+            };
+        }
+    }
+    if component.ecosystem == Ecosystem::Python && files.len() > 1 {
+        return LockfileSelection {
+            files,
+            selected: None,
+            ambiguous: true,
+            detail: Some("multiple Python lockfiles".to_string()),
+        };
+    }
+    let observations = files
+        .iter()
+        .map(|file| {
+            (
+                file.clone(),
+                lockfile::observe(&detection.root.join(file), file),
+            )
+        })
+        .collect::<Vec<_>>();
+    let established = observations
+        .iter()
+        .filter(|(_, observation)| observation.established())
+        .collect::<Vec<_>>();
+    if established.is_empty() {
+        let detail = observations
+            .iter()
+            .filter_map(|(_, observation)| observation.detail.clone())
+            .collect::<Vec<_>>();
+        return LockfileSelection {
+            files,
+            selected: None,
+            ambiguous: false,
+            detail: Some(if detail.is_empty() {
+                "lockfile dependency set not established".to_string()
+            } else {
+                detail.join("; ")
+            }),
+        };
+    }
+    let first = &established[0].1.packages;
+    if established
+        .iter()
+        .all(|(_, observation)| observation.packages == *first)
+    {
+        let (source, observation) = established[0];
+        return LockfileSelection {
+            files,
+            selected: Some((source.clone(), observation.clone())),
+            ambiguous: false,
+            detail: None,
+        };
+    }
+    LockfileSelection {
+        files,
+        selected: None,
+        ambiguous: true,
+        detail: Some("lockfiles record different dependency sets".to_string()),
+    }
+}
+
+/// Normalizes a Python distribution name per PEP 503: lowercase, with runs of
+/// `-`, `_`, and `.` collapsed to a single hyphen.
+fn normalize_python_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut separator = false;
+    for character in name.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            separator = true;
+            continue;
+        }
+        if separator && !normalized.is_empty() {
+            normalized.push('-');
+        }
+        separator = false;
+        normalized.push(character.to_ascii_lowercase());
+    }
+    normalized
+}
+
+fn lockfile_contains(
+    ecosystem: Ecosystem,
+    packages: &std::collections::BTreeSet<String>,
+    name: &str,
+) -> bool {
+    if ecosystem == Ecosystem::Python {
+        let name = normalize_python_name(name);
+        packages
+            .iter()
+            .any(|package| normalize_python_name(package) == name)
+    } else {
+        packages.contains(name)
+    }
+}
+
+fn declared_dependencies(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> Vec<NativeDependency> {
+    let mut dependencies = detection
+        .native_dependencies
+        .iter()
+        .filter(|dependency| dependency.ecosystem == component.ecosystem)
+        .filter(|dependency| {
+            dependency_owner(
+                &dependency.source,
+                &detection.components,
+                dependency.ecosystem,
+            )
+            .is_some_and(|owner| owner.path == component.path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // Root JavaScript declarations live in `package_json_data`; nested manifests
+    // were already collected by component detection.
+    if component.ecosystem == Ecosystem::JavaScript
+        && component.path == "."
+        && let Some(data) = &detection.package_json_data
+    {
+        for (group, kind, native_kind) in [
+            (&data.dependencies, "dependency", "runtime-dependency"),
+            (
+                &data.dev_dependencies,
+                "development",
+                "development-dependency",
+            ),
+            (
+                &data.optional_dependencies,
+                "optional",
+                "optional-dependency",
+            ),
+            (&data.peer_dependencies, "peer", "peer-dependency"),
+        ] {
+            for (name, specifier) in group {
+                dependencies.push(NativeDependency {
+                    name: name.clone(),
+                    specifier: specifier.clone(),
+                    kind: kind.to_string(),
+                    ecosystem: Ecosystem::JavaScript,
+                    native_kind: native_kind.to_string(),
+                    source: "package.json".to_string(),
+                });
+            }
+        }
+    }
+    sort_dependencies(&mut dependencies);
+    dependencies
+}
+
+fn ancestor_node_modules(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> Vec<(String, PathBuf)> {
+    let mut result = Vec::new();
+    let mut directory = component_directory(detection, component);
+    loop {
+        let node_modules = directory.join("node_modules");
+        if node_modules.is_dir() {
+            let source = directory
+                .strip_prefix(&detection.root)
+                .ok()
+                .and_then(Path::to_str)
+                .filter(|relative| !relative.is_empty())
+                .map_or_else(
+                    || "node_modules/".to_string(),
+                    |relative| format!("{relative}/node_modules/"),
+                );
+            result.push((source, node_modules));
+        }
+        if directory == detection.root {
+            break;
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if !parent.starts_with(&detection.root) {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    result
+}
+
+fn count_node_modules_packages(directory: &Path) -> std::io::Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if name.starts_with('@') && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            for child in fs::read_dir(entry.path())? {
+                let child = child?;
+                if !child.file_name().to_string_lossy().starts_with('.') {
+                    count += 1;
+                }
+            }
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn javascript_installed_fact(
+    detection: &RepositoryDetection,
+    component: &Component,
+    name: &str,
+) -> DependencyFact {
+    let parents = ancestor_node_modules(detection, component);
+    let first_source = parents.first().map(|(source, _)| source.clone());
+    let mut unreadable = None;
+    for (source, directory) in &parents {
+        match fs::metadata(directory.join(name)) {
+            Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
+                return DependencyFact {
+                    status: "present".to_string(),
+                    source: Some(format!("{source}{name}")),
+                    evidence: vec![format!("{source}{name}")],
+                    detail: None,
+                };
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => unreadable = Some((source.clone(), error.kind())),
+        }
+    }
+    if let Some((source, kind)) = unreadable {
+        return DependencyFact {
+            status: "unknown".to_string(),
+            source: Some(source),
+            evidence: Vec::new(),
+            detail: Some(format!("installed location not readable: {kind:?}")),
+        };
+    }
+    DependencyFact {
+        status: "absent".to_string(),
+        source: first_source.or_else(|| Some("node_modules/".to_string())),
+        evidence: Vec::new(),
+        detail: None,
+    }
+}
+
+fn python_site_packages(environment: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for library in ["lib", "lib64"] {
+        let library_dir = environment.join(library);
+        if !library_dir.is_dir() {
+            continue;
+        }
+        let direct = library_dir.join("site-packages");
+        if direct.is_dir() {
+            directories.push(direct);
+        }
+        if let Ok(entries) = fs::read_dir(&library_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("python") {
+                    let site_packages = entry.path().join("site-packages");
+                    if site_packages.is_dir() {
+                        directories.push(site_packages);
+                    }
+                }
+            }
+        }
+    }
+    let windows = environment.join("Lib").join("site-packages");
+    if windows.is_dir() {
+        directories.push(windows);
+    }
+    directories.sort();
+    directories.dedup();
+    directories
+}
+
+fn python_site_packages_entries(
+    directories: &[PathBuf],
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut packages = std::collections::BTreeSet::new();
+    let mut readable = false;
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        readable = true;
+        let mut saw_metadata = false;
+        let mut plain = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(base) = name
+                .strip_suffix(".dist-info")
+                .or_else(|| name.strip_suffix(".egg-info"))
+            {
+                saw_metadata = true;
+                let package = distribution_name(base);
+                if !package.is_empty() {
+                    packages.insert(package.to_string());
+                }
+            } else if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !name.starts_with('.')
+                && !name.starts_with('_')
+                && !matches!(name.as_str(), "bin" | "include")
+            {
+                plain.push(name);
+            }
+        }
+        if !saw_metadata {
+            packages.extend(plain);
+        }
+    }
+    readable.then_some(packages)
+}
+
+/// Extracts a distribution name from a `*.dist-info` or `*.egg-info` directory.
+/// Version suffixes begin with a digit, and older egg metadata may append an
+/// interpreter tag after the version, so scan from the right for the first
+/// hyphen followed by a digit.
+fn distribution_name(base: &str) -> &str {
+    let base = base.strip_prefix("__editable__.").unwrap_or(base);
+    for (index, character) in base.char_indices().rev() {
+        if character == '-'
+            && base[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit())
+        {
+            return &base[..index];
+        }
+    }
+    base
+}
+
+enum PythonInstall {
+    Established {
+        packages: std::collections::BTreeSet<String>,
+        source: String,
+    },
+    Unknown {
+        source: Option<String>,
+        detail: String,
+    },
+}
+
+fn python_install(detection: &RepositoryDetection, component: &Component) -> PythonInstall {
+    let directory = component_directory(detection, component);
+    for name in [".venv", "venv", ".env"] {
+        let environment = directory.join(name);
+        if !environment.is_dir() {
+            continue;
+        }
+        let source = component_file(component, &format!("{name}/"));
+        let site_packages = python_site_packages(&environment);
+        if site_packages.is_empty() {
+            return PythonInstall::Unknown {
+                source: Some(source),
+                detail: "Python environment has no site-packages directory".to_string(),
+            };
+        }
+        return match python_site_packages_entries(&site_packages) {
+            Some(packages) => PythonInstall::Established { packages, source },
+            None => PythonInstall::Unknown {
+                source: Some(source),
+                detail: "site-packages is not readable".to_string(),
+            },
+        };
+    }
+    PythonInstall::Unknown {
+        source: None,
+        detail: "no conventional Python environment directory".to_string(),
+    }
+}
+
+fn python_installed_fact(
+    detection: &RepositoryDetection,
+    component: &Component,
+    name: &str,
+) -> DependencyFact {
+    match python_install(detection, component) {
+        PythonInstall::Established { packages, source } => {
+            let name = normalize_python_name(name);
+            let present = packages
+                .iter()
+                .any(|package| normalize_python_name(package) == name);
+            DependencyFact {
+                status: if present { "present" } else { "absent" }.to_string(),
+                source: Some(source),
+                evidence: Vec::new(),
+                detail: None,
+            }
+        }
+        PythonInstall::Unknown { source, detail } => DependencyFact {
+            status: "unknown".to_string(),
+            source,
+            evidence: Vec::new(),
+            detail: Some(detail),
+        },
+    }
+}
+
+fn installed_dependency_fact(
+    detection: &RepositoryDetection,
+    component: &Component,
+    name: &str,
+) -> DependencyFact {
+    match component.ecosystem {
+        Ecosystem::JavaScript => javascript_installed_fact(detection, component, name),
+        Ecosystem::Python => python_installed_fact(detection, component, name),
+        Ecosystem::Rust => DependencyFact {
+            status: "unknown".to_string(),
+            source: None,
+            evidence: Vec::new(),
+            detail: Some(
+                "Cargo installs packages outside the project; no static installed-package observer"
+                    .to_string(),
+            ),
+        },
+        Ecosystem::Container => DependencyFact {
+            status: "unknown".to_string(),
+            source: None,
+            evidence: Vec::new(),
+            detail: Some("container dependencies are not observed statically".to_string()),
+        },
+    }
+}
+
+fn installed_observation(
+    detection: &RepositoryDetection,
+    component: &Component,
+) -> (String, Vec<String>, Option<usize>, Option<String>) {
+    match component.ecosystem {
+        Ecosystem::JavaScript => match javascript_node_modules(detection, component) {
+            Some(source) => match count_node_modules_packages(&detection.root.join(&source)) {
+                Ok(0) => (
+                    "absent".to_string(),
+                    vec![source],
+                    Some(0),
+                    Some("node_modules exists but contains no packages".to_string()),
+                ),
+                Ok(count) => ("present".to_string(), vec![source], Some(count), None),
+                Err(error) => (
+                    "unknown".to_string(),
+                    vec![source],
+                    None,
+                    Some(format!("node_modules not readable: {:?}", error.kind())),
+                ),
+            },
+            None => (
+                "absent".to_string(),
+                vec!["node_modules/".to_string()],
+                Some(0),
+                None,
+            ),
+        },
+        Ecosystem::Rust => (
+            "unknown".to_string(),
+            Vec::new(),
+            None,
+            Some(
+                "Cargo installs packages outside the project; target/ is build output".to_string(),
+            ),
+        ),
+        Ecosystem::Python => match python_install(detection, component) {
+            PythonInstall::Established { packages, source } if packages.is_empty() => (
+                "absent".to_string(),
+                vec![source],
+                Some(0),
+                Some("site-packages contains no packages".to_string()),
+            ),
+            PythonInstall::Established { packages, source } => (
+                "present".to_string(),
+                vec![source],
+                Some(packages.len()),
+                None,
+            ),
+            PythonInstall::Unknown { source, detail } => (
+                "unknown".to_string(),
+                source.into_iter().collect(),
+                None,
+                Some(detail),
+            ),
+        },
+        Ecosystem::Container => (
+            "unknown".to_string(),
+            Vec::new(),
+            None,
+            Some("container installation is not observed statically".to_string()),
+        ),
+    }
+}
+
 fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
     let declared: Vec<RealityObservation> = detection
         .components
@@ -948,29 +1588,32 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
             evidence: component
                 .manifests
                 .iter()
-                .map(|path| {
-                    if component.path == "." {
-                        path.clone()
-                    } else {
-                        format!("{}/{}", component.path, path)
-                    }
-                })
+                .map(|path| component_file(component, path))
                 .collect(),
+            format: None,
+            package_count: None,
+            detail: None,
         })
         .collect();
     let resolved: Vec<RealityObservation> = detection
         .components
         .iter()
         .flat_map(|component| {
-            component.lockfiles.iter().map(|path| RealityObservation {
-                subject: component.path.clone(),
-                status: "present".to_string(),
-                source: "filesystem".to_string(),
-                evidence: vec![if component.path == "." {
-                    path.clone()
-                } else {
-                    format!("{}/{}", component.path, path)
-                }],
+            let directory = component_directory(detection, component);
+            component.lockfiles.iter().map(move |path| {
+                let display = component_file(component, path);
+                let observation = lockfile::observe(&directory.join(path), &display);
+                RealityObservation {
+                    subject: component.path.clone(),
+                    status: observation.status.to_string(),
+                    source: "filesystem".to_string(),
+                    evidence: vec![display],
+                    format: observation.format.map(|format| format.name().to_string()),
+                    package_count: observation
+                        .established()
+                        .then_some(observation.packages.len()),
+                    detail: observation.detail,
+                }
             })
         })
         .collect();
@@ -978,35 +1621,16 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         .components
         .iter()
         .map(|component| {
-            let path = detection.root.join(&component.path);
-            let (status, evidence) = match component.ecosystem {
-                Ecosystem::JavaScript => match javascript_node_modules(detection, component) {
-                    Some(source) => ("present", vec![source]),
-                    None => ("absent", vec!["node_modules/".to_string()]),
-                },
-                Ecosystem::Rust => {
-                    if path.join("target").is_dir() {
-                        ("present", vec!["target/".to_string()])
-                    } else {
-                        ("unknown", Vec::new())
-                    }
-                }
-                Ecosystem::Python => {
-                    let environment = [".venv", "venv", ".env"]
-                        .iter()
-                        .find(|name| path.join(name).is_dir());
-                    match environment {
-                        Some(name) => ("present", vec![format!("{name}/")]),
-                        None => ("unknown", Vec::new()),
-                    }
-                }
-                Ecosystem::Container => ("unknown", Vec::new()),
-            };
+            let (status, evidence, package_count, detail) =
+                installed_observation(detection, component);
             RealityObservation {
                 subject: component.path.clone(),
-                status: status.to_string(),
+                status,
                 source: "filesystem".to_string(),
                 evidence,
+                format: None,
+                package_count,
+                detail,
             }
         })
         .collect();
@@ -1020,24 +1644,76 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
                 status: "unknown".to_string(),
                 source: "docker".to_string(),
                 evidence: vec!["docker compose ps".to_string()],
+                format: None,
+                package_count: None,
+                detail: Some("no runtime observation was performed".to_string()),
             })
             .collect()
     } else {
         Vec::new()
     };
+    let mut dependencies = Vec::new();
+    for component in &detection.components {
+        let lockfile = select_component_lockfile(detection, component);
+        for dependency in declared_dependencies(detection, component) {
+            let lockfile_fact = lockfile.dependency_fact(dependency.ecosystem, &dependency.name);
+            let installed_fact = installed_dependency_fact(detection, component, &dependency.name);
+            let runtime_fact = live.then(|| DependencyFact {
+                status: "unknown".to_string(),
+                source: Some("runtime".to_string()),
+                evidence: Vec::new(),
+                detail: Some("no runtime dependency observer for this ecosystem".to_string()),
+            });
+            dependencies.push(DependencyObservation {
+                name: dependency.name.clone(),
+                specifier: dependency.specifier.clone(),
+                kind: dependency.kind.clone(),
+                ecosystem: dependency.ecosystem,
+                component: component.path.clone(),
+                declared: DependencyFact {
+                    status: "present".to_string(),
+                    source: Some(dependency.source.clone()),
+                    evidence: vec![dependency.source.clone()],
+                    detail: None,
+                },
+                lockfile: lockfile_fact,
+                installed: installed_fact,
+                runtime: runtime_fact,
+            });
+        }
+    }
+    dependencies.sort_by(|a, b| {
+        a.component
+            .cmp(&b.component)
+            .then_with(|| format!("{:?}", a.ecosystem).cmp(&format!("{:?}", b.ecosystem)))
+            .then(a.name.cmp(&b.name))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.specifier.cmp(&b.specifier))
+    });
     let unsupported = detection.components.is_empty();
-    let partial = declared
+    let observation_undetermined = declared
         .iter()
         .chain(resolved.iter())
         .chain(installed.iter())
         .chain(runtime.iter())
-        .any(|observation| observation.status == "unknown");
+        .any(|observation| !matches!(observation.status.as_str(), "present" | "absent"));
+    let dependency_undetermined = dependencies.iter().any(|dependency| {
+        [
+            Some(&dependency.declared),
+            Some(&dependency.lockfile),
+            Some(&dependency.installed),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(dependency.runtime.iter())
+        .any(|fact| !matches!(fact.status.as_str(), "present" | "absent"))
+    });
     RealityOutput {
         schema: contract::REALITY_SCHEMA,
         schema_version: LEGACY_SCHEMA_VERSION,
         outcome: if unsupported {
             Outcome::Unsupported
-        } else if partial {
+        } else if observation_undetermined || dependency_undetermined {
             Outcome::Partial
         } else {
             Outcome::Ok
@@ -1056,7 +1732,37 @@ fn build_reality(detection: &RepositoryDetection, live: bool) -> RealityOutput {
         runtime: RealityLayer {
             observations: runtime,
         },
+        dependencies,
         cargo: detection.cargo.clone(),
+    }
+}
+
+fn drift_issue_exists(issues: &[DriftItem], subject: &str, status: &str, expected: &str) -> bool {
+    issues.iter().any(|issue| {
+        issue.subject == subject && issue.status == status && issue.expected == expected
+    })
+}
+
+fn push_drift_issue(issues: &mut Vec<DriftItem>, issue: DriftItem) {
+    if !drift_issue_exists(issues, &issue.subject, &issue.status, &issue.expected) {
+        issues.push(issue);
+    }
+}
+
+fn dependency_subject(component: &Component, name: &str) -> String {
+    if component.path == "." {
+        format!("./{name}")
+    } else {
+        format!("{}/{}", component.path, name)
+    }
+}
+
+fn reconcile_in_lockfile(dependency: &NativeDependency) -> bool {
+    match dependency.ecosystem {
+        Ecosystem::JavaScript => dependency.kind != "peer",
+        Ecosystem::Python => dependency.kind != "build",
+        Ecosystem::Rust => true,
+        Ecosystem::Container => false,
     }
 }
 
@@ -1073,41 +1779,13 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
         .iter()
         .filter_map(|file| manager_from_lockfile(file).map(|manager| (manager, file)))
         .collect::<Vec<_>>();
-    if let Some(manager) = package_manager {
-        if js_locks.iter().any(|(found, _)| *found != manager) {
-            issues.push(DriftItem {
-                subject: ".".to_string(),
-                status: "drift".to_string(),
-                expected: manager.to_string(),
-                actual: js_locks
-                    .iter()
-                    .map(|(_, file)| file.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                evidence: js_locks
-                    .iter()
-                    .map(|(_, file)| DriftEvidence {
-                        source: (*file).clone(),
-                        kind: "resolved".to_string(),
-                    })
-                    .chain(std::iter::once(DriftEvidence {
-                        source: "package.json".to_string(),
-                        kind: "declared".to_string(),
-                    }))
-                    .collect(),
-            });
-        }
-    } else if js_locks
-        .iter()
-        .map(|(manager, _)| *manager)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        > 1
+    if let Some(manager) = package_manager
+        && js_locks.iter().any(|(found, _)| *found != manager)
     {
         issues.push(DriftItem {
             subject: ".".to_string(),
-            status: "ambiguous".to_string(),
-            expected: "one JavaScript package-manager authority".to_string(),
+            status: "drift".to_string(),
+            expected: manager.to_string(),
             actual: js_locks
                 .iter()
                 .map(|(_, file)| file.as_str())
@@ -1119,74 +1797,223 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
                     source: (*file).clone(),
                     kind: "resolved".to_string(),
                 })
+                .chain(std::iter::once(DriftEvidence {
+                    source: "package.json".to_string(),
+                    kind: "declared".to_string(),
+                }))
                 .collect(),
         });
     }
-    if let (Some(data), Some(lockfile)) = (
-        detection.package_json_data.as_ref(),
-        detection
-            .manager
-            .as_ref()
-            .and_then(|manager| manager.lockfile.as_ref()),
-    ) {
-        let contents = fs::read_to_string(detection.root.join(lockfile)).unwrap_or_default();
-        for name in data.dependencies.keys() {
-            if !contents.contains(name) {
-                issues.push(DriftItem {
-                    subject: format!("./{name}"),
-                    status: "drift".to_string(),
-                    expected: "declared dependency in resolved lockfile".to_string(),
-                    actual: format!("{name} missing from {lockfile}"),
-                    evidence: vec![
-                        DriftEvidence {
-                            source: "package.json".to_string(),
-                            kind: "declared".to_string(),
-                        },
-                        DriftEvidence {
-                            source: lockfile.clone(),
-                            kind: "resolved".to_string(),
-                        },
-                    ],
-                });
-            }
-        }
-    }
+
     for component in &detection.components {
-        if component.ecosystem == Ecosystem::Python && component.lockfiles.len() > 1 {
-            issues.push(DriftItem {
-                subject: component.path.clone(),
-                status: "ambiguous".to_string(),
-                expected: "one Python resolution authority".to_string(),
-                actual: component.lockfiles.join(", "),
-                evidence: component
-                    .lockfiles
+        let declared = declared_dependencies(detection, component);
+        let selection = select_component_lockfile(detection, component);
+        if selection.ambiguous {
+            push_drift_issue(
+                &mut issues,
+                DriftItem {
+                    subject: component.path.clone(),
+                    status: "ambiguous".to_string(),
+                    expected: "one dependency resolution authority".to_string(),
+                    actual: selection.files.join(", "),
+                    evidence: selection
+                        .files
+                        .iter()
+                        .map(|source| DriftEvidence {
+                            source: source.clone(),
+                            kind: "resolved".to_string(),
+                        })
+                        .collect(),
+                },
+            );
+        }
+
+        let rust_declarations_authoritative = component.ecosystem != Ecosystem::Rust
+            || detection
+                .cargo
+                .as_ref()
+                .is_some_and(|cargo| cargo.source.starts_with("cargo metadata"));
+        let lockfile_dependencies = declared
+            .iter()
+            .filter(|dependency| reconcile_in_lockfile(dependency))
+            .collect::<Vec<_>>();
+        if !lockfile_dependencies.is_empty() && rust_declarations_authoritative {
+            if let Some((source, observation)) = &selection.selected {
+                for dependency in &lockfile_dependencies {
+                    if !lockfile_contains(
+                        dependency.ecosystem,
+                        &observation.packages,
+                        &dependency.name,
+                    ) {
+                        push_drift_issue(
+                            &mut issues,
+                            DriftItem {
+                                subject: dependency_subject(component, &dependency.name),
+                                status: "drift".to_string(),
+                                expected: "declared dependency recorded in resolvable lockfile"
+                                    .to_string(),
+                                actual: format!("{} missing from {source}", dependency.name),
+                                evidence: vec![
+                                    DriftEvidence {
+                                        source: dependency.source.clone(),
+                                        kind: "declared".to_string(),
+                                    },
+                                    DriftEvidence {
+                                        source: source.clone(),
+                                        kind: "resolved".to_string(),
+                                    },
+                                ],
+                            },
+                        );
+                    }
+                }
+            } else if !selection.files.is_empty() && !selection.ambiguous {
+                let mut evidence = selection
+                    .files
                     .iter()
                     .map(|source| DriftEvidence {
-                        source: format!("{}/{}", component.path, source),
+                        source: source.clone(),
                         kind: "resolved".to_string(),
                     })
-                    .collect(),
-            });
+                    .collect::<Vec<_>>();
+                for dependency in &lockfile_dependencies {
+                    if !evidence.iter().any(|item| item.source == dependency.source) {
+                        evidence.push(DriftEvidence {
+                            source: dependency.source.clone(),
+                            kind: "declared".to_string(),
+                        });
+                    }
+                }
+                push_drift_issue(
+                    &mut issues,
+                    DriftItem {
+                        subject: component.path.clone(),
+                        status: "unknown".to_string(),
+                        expected: "lockfile-recorded dependencies".to_string(),
+                        actual: format!("{} could not be interpreted", selection.files.join(", ")),
+                        evidence,
+                    },
+                );
+            }
         }
-        if component.ecosystem == Ecosystem::JavaScript
-            && javascript_node_modules(detection, component).is_none()
+
+        if component.ecosystem == Ecosystem::JavaScript {
+            let runtime = declared
+                .iter()
+                .filter(|dependency| dependency.kind == "dependency")
+                .collect::<Vec<_>>();
+            if !runtime.is_empty() {
+                match javascript_node_modules(detection, component) {
+                    None => issues.push(DriftItem {
+                        subject: component.path.clone(),
+                        status: "drift".to_string(),
+                        expected: "installed dependencies".to_string(),
+                        actual: "node_modules/ absent".to_string(),
+                        evidence: vec![
+                            DriftEvidence {
+                                source: component_file(component, "package.json"),
+                                kind: "declared".to_string(),
+                            },
+                            DriftEvidence {
+                                source: "node_modules/".to_string(),
+                                kind: "installed".to_string(),
+                            },
+                        ],
+                    }),
+                    Some(_) => {
+                        for dependency in runtime {
+                            let fact =
+                                javascript_installed_fact(detection, component, &dependency.name);
+                            match fact.status.as_str() {
+                                "present" => {}
+                                "absent" => push_drift_issue(
+                                    &mut issues,
+                                    DriftItem {
+                                        subject: dependency_subject(component, &dependency.name),
+                                        status: "drift".to_string(),
+                                        expected: "declared dependency installed".to_string(),
+                                        actual: format!(
+                                            "{} missing from installed packages",
+                                            dependency.name
+                                        ),
+                                        evidence: vec![
+                                            DriftEvidence {
+                                                source: dependency.source.clone(),
+                                                kind: "declared".to_string(),
+                                            },
+                                            DriftEvidence {
+                                                source: fact
+                                                    .source
+                                                    .clone()
+                                                    .unwrap_or_else(|| "node_modules/".to_string()),
+                                                kind: "installed".to_string(),
+                                            },
+                                        ],
+                                    },
+                                ),
+                                _ => push_drift_issue(
+                                    &mut issues,
+                                    DriftItem {
+                                        subject: dependency_subject(component, &dependency.name),
+                                        status: "unknown".to_string(),
+                                        expected: "installed dependencies".to_string(),
+                                        actual: format!(
+                                            "{} installed state not established",
+                                            dependency.name
+                                        ),
+                                        evidence: vec![DriftEvidence {
+                                            source: fact
+                                                .source
+                                                .clone()
+                                                .unwrap_or_else(|| "node_modules/".to_string()),
+                                            kind: "installed".to_string(),
+                                        }],
+                                    },
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if component.ecosystem == Ecosystem::Python
+            && let PythonInstall::Established { packages, source } =
+                python_install(detection, component)
         {
-            issues.push(DriftItem {
-                subject: component.path.clone(),
-                status: "drift".to_string(),
-                expected: "installed dependencies".to_string(),
-                actual: "node_modules/ absent".to_string(),
-                evidence: vec![
-                    DriftEvidence {
-                        source: "package.json".to_string(),
-                        kind: "declared".to_string(),
-                    },
-                    DriftEvidence {
-                        source: "node_modules/".to_string(),
-                        kind: "installed".to_string(),
-                    },
-                ],
-            });
+            for dependency in declared
+                .iter()
+                .filter(|dependency| dependency.kind == "dependency")
+            {
+                let name = normalize_python_name(&dependency.name);
+                if !packages
+                    .iter()
+                    .any(|package| normalize_python_name(package) == name)
+                {
+                    push_drift_issue(
+                        &mut issues,
+                        DriftItem {
+                            subject: dependency_subject(component, &dependency.name),
+                            status: "drift".to_string(),
+                            expected: "declared dependency installed".to_string(),
+                            actual: format!(
+                                "{} missing from {} site-packages",
+                                dependency.name, source
+                            ),
+                            evidence: vec![
+                                DriftEvidence {
+                                    source: dependency.source.clone(),
+                                    kind: "declared".to_string(),
+                                },
+                                DriftEvidence {
+                                    source: source.clone(),
+                                    kind: "installed".to_string(),
+                                },
+                            ],
+                        },
+                    );
+                }
+            }
         }
     }
     if live {
@@ -1208,6 +2035,9 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
     issues.sort_by(|a, b| a.subject.cmp(&b.subject).then(a.status.cmp(&b.status)));
     let unsupported = detection.components.is_empty();
     let partial = issues.iter().any(|issue| issue.status == "unknown");
+    let has_drift = issues.iter().any(|issue| issue.status == "drift");
+    let has_ambiguous = issues.iter().any(|issue| issue.status == "ambiguous");
+    let has_unknown = issues.iter().any(|issue| issue.status == "unknown");
     DriftOutput {
         schema: contract::DRIFT_SCHEMA,
         schema_version: LEGACY_SCHEMA_VERSION,
@@ -1222,12 +2052,14 @@ fn build_drift(detection: &RepositoryDetection, live: bool) -> DriftOutput {
         live,
         status: if unsupported {
             "unsupported".to_string()
-        } else if issues.iter().any(|issue| issue.status == "drift") {
+        } else if has_drift {
             "drift".to_string()
-        } else if issues.is_empty() {
-            "match".to_string()
-        } else {
+        } else if has_ambiguous {
             "ambiguous".to_string()
+        } else if has_unknown {
+            "unknown".to_string()
+        } else {
+            "match".to_string()
         },
         issues,
         cargo: detection.cargo.clone(),
@@ -1272,7 +2104,13 @@ fn render_drift(output: &DriftOutput) -> String {
     if output.issues.is_empty() {
         return "NO DRIFT".to_string();
     }
-    let mut lines = vec![format!("{} issues", output.issues.len())];
+    let mut lines = Vec::new();
+    match output.status.as_str() {
+        "unknown" => lines.push("UNKNOWN".to_string()),
+        "ambiguous" => lines.push("AMBIGUOUS".to_string()),
+        _ => {}
+    }
+    lines.push(format!("{} issues", output.issues.len()));
     lines.extend(
         output
             .issues
@@ -4651,6 +5489,31 @@ mod tests {
         assert_eq!(python_tool(&root, false, true), "pipenv");
         // pyproject.toml wins the ambiguity, so pipenv is not selected.
         assert_eq!(python_tool(&root, true, true), "pip");
+    }
+
+    #[test]
+    fn python_distribution_metadata_names_are_extracted() {
+        assert_eq!(
+            distribution_name("typing_extensions-4.12.0"),
+            "typing_extensions"
+        );
+        assert_eq!(
+            distribution_name("zope.interface-6.0-py3.12"),
+            "zope.interface"
+        );
+        assert_eq!(distribution_name("__editable__.svc-0.1.0"), "svc");
+        assert_eq!(distribution_name("localpackage"), "localpackage");
+    }
+
+    #[test]
+    fn python_distribution_names_follow_pep_503() {
+        assert_eq!(
+            normalize_python_name("typing_extensions"),
+            "typing-extensions"
+        );
+        assert_eq!(normalize_python_name("zope.interface"), "zope-interface");
+        assert_eq!(normalize_python_name("Foo__Bar..baz"), "foo-bar-baz");
+        assert_eq!(normalize_python_name("requests"), "requests");
     }
 
     #[test]

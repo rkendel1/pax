@@ -23,12 +23,13 @@ PAX today is a file-reading project inspector with a thin delegation layer. It
 detects JavaScript, Python, Rust, and container projects from manifests and
 lockfiles, reports declared dependencies and scripts (accurately for
 `package.json`, Cargo, Python TOML/requirements/Pipfile, and Compose services),
-checks whether a few conventional directories exist, selects a native tool
-deterministically, and can run that tool and, for Cargo tests, state what the
-result means. It does not resolve dependencies, probe the host, run workloads on
-its own authority, or know anything about runtime versions. Its `reality`
-vocabulary describes presence checks, not verified reality, and the `--live`
-`runtime` field claims more than it does.
+parses recognized lockfile package sets, enumerates package names in
+conventional install directories, selects a native tool deterministically, and
+can run that tool and, for Cargo tests, state what the result means. It does not
+resolve dependencies, probe the host, run workloads on its own authority, or
+know anything about runtime versions. Its `reality` vocabulary describes
+layered evidence, not verified reality, and the `--live` `runtime` field claims
+more than it does.
 
 ## What PAX actually does
 
@@ -43,8 +44,8 @@ Inventory (all verified in code; "Det." = deterministic given identical files):
 | Rust via Cargo | yes | `detect_cargo`: `cargo metadata --no-deps --offline`; else TOML fallback with `source: "Cargo.toml fallback"` | `cargo{}`, `nativeDependencies[]` | yes | `cargo` on PATH | `cargo_workspace_*` tests |
 | Container detection/parse | yes | `detect_container_component`; Dockerfile line scanner, Compose services limited to direct children of `services:` | `container{}` | yes | none | `tests/discovery.rs` |
 | Dependency graph | yes (declared edges only) | `build_graph` | `nodes`, `edges`, `evidence` | yes (sorted) | none | `graph_json_preserves…` |
-| "Reality" layers | partial | `build_reality` (field table below) | 4 layers | yes | none | `reality_json_is_static…` |
-| Drift | partial | `build_drift`; lockfile check is `contents.contains(name)` | `status`, `issues[]` | yes | none | `drift_json_reports_conflicts…` |
+| "Reality" layers | partial | `build_reality` (field table below); `src/lockfile.rs` parses recognized lockfiles | 4 layers + `dependencies[]` | yes | none | `reality_json_is_static…`, `tests/reconciliation.rs` |
+| Drift | partial | `build_drift`; reconciles parsed lockfile package sets and installed package names | `status`, `issues[]` | yes | none | `drift_json_reports_conflicts…`, `malformed_lockfile_is_unknown…` |
 | `--live` | not implemented | no process is started; `runtime` entries carry `status: "unknown"` | see below | yes | none | `known_limitation_live_*` |
 | Host tool/runtime detection | not implemented | `detect_node_runtime()` is `fn … { None }` | `result.runtime: null` | — | — | pinned |
 | Tool selection for operations | yes | `resolve_operation`, `selection_ambiguity` (fail-closed) | plan / exit 2 | yes | none | many |
@@ -76,9 +77,11 @@ Directly, at invocation time, with no timestamp recorded:
   path) via `cargo metadata`.
 
 PAX does **not** observe: which tools are installed or their versions or paths;
-Node/Python/Rust runtime versions; lockfile contents (beyond a substring search
-in drift); installed package contents or versions; environment variables;
-OS/arch; running containers; network; git state.
+Node/Python/Rust runtime versions; lockfile contents beyond the recognized
+formats it parses; installed package versions; environment variables;
+OS/arch; running containers; network; git state. It enumerates installed
+package *names* from `node_modules/` and Python `site-packages/`, but never
+executes a package manager or imports a package.
 
 ## What PAX derives
 
@@ -86,8 +89,9 @@ OS/arch; running containers; network; git state.
 - Package-manager selection and the reason (`packageManager` field, then
   lockfile precedence; Python: first of uv/poetry/pdm lockfile, else `pip`).
 - Graph nodes/edges (project → declared dependency; workspace → member).
-- `drift` issues (field vs. lockfile; multiple lockfiles; missing
-  `node_modules`).
+- `drift` issues (declared dependency vs. parsed lockfile package set; multiple
+  lockfiles; declared dependency vs. enumerated installed packages; missing
+  `node_modules`; uninterpretable lockfiles as `unknown`).
 - Execution plans (tool, command vector, evidence, selection reason).
 - Execution results (`status`, `reason`, `tests`) from native output.
 
@@ -99,12 +103,17 @@ Claims in output and what supports them:
 - *"Detected npm package reality for j"* (`info.result.summary`) — overstated: a
   manager was selected from a field or lockfile; nothing about reality was
   verified.
-- *"installed: present"* — directory exists (empty `node_modules/` qualifies;
-  Rust's `target/` is build output, not installed dependencies). Weak.
-- *"resolved: present"* — a lockfile exists. PAX does not read it for this layer.
-- *"drift: declared dependency missing from lockfile"* — name not found by
-  substring search; a short name such as `a` matches almost any lockfile, so
-  false negatives are likely. Weak.
+- *"installed: present"* — at least one package name was enumerated in
+  `node_modules/` or Python `site-packages/` (empty `node_modules/` is
+  `absent`; Rust's `target/` is build output, not installed dependencies).
+- *"resolved: present"* — a recognized lockfile was read and its package set
+  parsed. `unknown` means the file exists but could not be interpreted.
+- *"drift: declared dependency missing from resolvable lockfile"* — the
+  dependency is absent from the parsed package set of an established lockfile.
+  Unknown or unparseable lockfiles produce `unknown`, not `drift`.
+- *"drift: declared dependency installed"* — the dependency name was not found
+  in an established installed-package set. Peer JavaScript dependencies are
+  excluded from lockfile reconciliation.
 - *"tests passed/failed/not_run"* — established from Cargo's exit status and
   libtest summaries, with reasons. Supported and tested.
 - *"unsupported"/"ambiguous"* — mirrors fail-closed selection. Supported.
@@ -131,21 +140,21 @@ timestamp, so staleness is unbounded; evidence is a list of relative paths.
 | `declared.observations[].status` | always `present` for each detected component | filesystem | observation | manifest paths | until files change | a manifest file exists; not that it parses or declares anything |
 | `declared…subject` | component path (`.` or subdir) | filesystem | derivation | — | — | — |
 | `declared…source` | always `filesystem` | constant | constant | — | — | — |
-| `resolved.observations[].status` | one per lockfile, always `present` | filesystem | observation | lockfile path | until files change | a lockfile exists. Not that it matches the manifest, parses, or is complete |
-| `installed.observations[].status` | JS: `present`/`absent` for `node_modules/`; Rust: `present` if `target/` exists else `unknown`; Python: `present` if `.venv`/`venv`/`.env` is a directory else `unknown`; Container: always `unknown` | filesystem | observation | directory name | until files change | a directory with that name exists. Not that dependencies are installed (empty dir counts), complete, or match the lockfile |
+| `resolved.observations[].status` | one per lockfile: `present` when the recognized format parsed, `unknown` when structurally empty/unparseable/unrecognized, `failed` on read error | filesystem + parsed contents (`src/lockfile.rs`) | observation | lockfile path; `format`; `packageCount` when established; `detail` when not | until files change | the recorded dependency set was established. Not that it matches the manifest, is complete, or is installed |
+| `installed.observations[].status` | JS: `present`/`absent` from enumerated package names in `node_modules/`; Rust/Container: always `unknown`; Python: `present`/`absent` when `site-packages/` was enumerated, `unknown` when no conventional environment exists | filesystem | observation | directory name + `packageCount` | until files change | package names exist in that directory. Not versions, completeness, or lockfile agreement |
+| `dependencies[]` | one entry per declaration with separate `declared`, `lockfile`, `installed`, and optional `runtime` facts | manifest + lockfile + installed directories | observation/derivation | each fact's `source`/`evidence` | until files change | each layer independently; no layer implies another |
 | `runtime.observations[]` | empty unless `--live`; with `--live`, one per Container component, `status: "unknown"`, `source: "docker"`, `evidence: ["docker compose ps"]` | constant | **none: no observation occurs** | names a command PAX did not run | — | nothing. The `evidence` string is a statement of intent, not evidence |
 | `cargo` | Cargo packages, members, dependencies, lockfile | `cargo metadata --no-deps --offline` or heuristic fallback | observation (external tool) / heuristic | `source` field names the method | until files change | Cargo reported these packages. `--no-deps` means dependency *resolution* is not observed |
 
 `drift` (`build_drift`): `issues[].status` is `drift`, `ambiguous`, or
 `unknown`; `expected`/`actual` are human strings; `evidence[].kind` is
-`declared`, `resolved`, `installed`, or `runtime`. Top-level `status` is
-`drift` if any issue is `drift`, `match` if there are no issues, otherwise
-`ambiguous` — so `unknown` runtime items under `--live` produce an
-`ambiguous` result (JSON exit code 2) although nothing is ambiguous; in text
-mode the same state exits 1 (anything other than the literal `NO DRIFT`
-counts as drift, `main.rs`). Also, a JS component without `node_modules/`
-reports `drift` ("expected installed dependencies") even when it declares no
-dependencies.
+`declared`, `resolved`, `installed`, or `runtime`. Top-level `status`
+precedence is `drift` > `ambiguous` > `unknown` > `match` (`unsupported` when
+nothing was detected). Exit codes are `1` for `drift`, `2` for `ambiguous`, and
+`0` for `match`, `unknown`, and `unsupported`; text mode prints `UNKNOWN` or
+`AMBIGUOUS` so evidence gaps are not confused with confirmed contradictions.
+A JS component without `node_modules/` reports `drift` only when it declares at
+least one runtime dependency.
 
 `graph`: nodes and edges are declared dependencies and workspace membership;
 `evidence` is the manifest path. It is a declared graph, not a resolved one.
@@ -282,9 +291,10 @@ Compute's PAX tests (21) pass against the current adapter.
 
 The architecture keeps these apart: `reality` has separate layers, drift
 evidence is labelled, and Compute's receipts carry `declared`/`resolved`/
-`verified`/`actual` blocks. The ambiguity is inside PAX: `reality`'s
-`declared` and `resolved` names are presence checks, and `info`/`deps` mix
-declared and inferred values without marking which is which.
+`verified`/`actual` blocks. Dependency evidence is now separated per layer:
+`declared`, lockfile-recorded, installed, and runtime facts each carry their
+own source and state. `info`/`deps` still mix declared and inferred values
+without marking which is which.
 
 ## Documentation overclaims
 
@@ -293,11 +303,11 @@ declared and inferred values without marking which is which.
 | README line 3 | "the universal, read-only project-tooling boundary" | four ecosystems; not read-only as a whole (README line 8 concedes delegation) |
 | README | "`pax info` reports detected package-manager reality" | reports selection from a field/lockfile |
 | README | "runtime inspection is opt-in with `--live`" | `--live` inspects nothing |
-| README | "`pax reality` separates declared, resolved, installed, and runtime observations" | presence checks; runtime layer has no observations |
+| README | "`pax reality` separates declared, resolved, installed, and runtime observations" | Fixed: each dependency layer carries its own state, source, and evidence; runtime remains `unknown` under `--live` |
 | README | "Cargo projects use … `cargo metadata --no-deps` for authoritative workspace semantics" | true when cargo succeeds; TOML fallback otherwise (provenance names the fallback) |
 | README | "native dependency semantics, and static container services" | accurate for Python TOML, requirements, Pipfile, nested `package.json`, and direct Compose services; unknown constructs are diagnosed |
-| README | "`pax drift` reports contradictions between those layers" | partly substring checks; `unknown` surfaces as `ambiguous` |
-| README | "unknown evidence is never promoted to drift" | true, but promoted to `ambiguous` |
+| README | "`pax drift` reports contradictions between those layers" | Fixed: reconciles parsed lockfile package sets and enumerated installed packages; unknown evidence is not a contradiction |
+| README | "unknown evidence is never promoted to drift" | Fixed: unknown evidence keeps top-level `status: "unknown"` and exit code 0 |
 | `info.result.summary` | "Detected … package reality" | string constant, see above |
 | `doctor` | `result.runtime` | always `null` |
 | Compute `docs/pax.md` | "PAX defines project and environment requirements"; "PAX … Owns what the project requires" | PAX reports declared dependencies and scripts only; no runtime, platform, or tool requirements |
@@ -336,8 +346,11 @@ whose identifiers must not be joined across edge kinds without inspecting them.
    `pax.execution-result.v1`.
 6. **P1** Per-field provenance (file + key) and an explicit `declared` /
    `inferred` / `observed` marker.
-7. **P1** Rename or restate the `installed`/`resolved` layers as presence
-   observations; stop counting empty directories and `target/`.
+7. **P1** ~~Rename or restate the `installed`/`resolved` layers as presence
+   observations; stop counting empty directories and `target/`.~~ Fixed:
+   `resolved` reports parsed lockfile state with format and package count;
+   empty `node_modules/` is `absent`; Rust installed state is always `unknown`
+   and `target/` is no longer evidence.
 8. **P2** Tool detection (path and version, observation only) if a consumer needs
    it; Compose and Dockerfile parsing; a stable project identity without
    machine paths; optional, separate observation timestamp.
@@ -351,8 +364,9 @@ whose identifiers must not be joined across edge kinds without inspecting them.
 2. `deploy`, `install`, `add`, `remove`, `exec` push PAX toward being an
    execution system. No code is moved in this PR; whether they stay is a
    product decision (see below).
-3. Consumers can read `reality`/`drift` (Foundry does) but nothing tells them
-   the layers are presence checks.
+3. Consumers can read `reality`/`drift` (Foundry does). The layered dependency
+   evidence and unknown status are documented in PAX_CONTRACT.md; the audit
+   keeps them separate from verified reality.
 4. Compute's "never dropped" rule has no mechanism, only two checks (above).
 5. No contract test across repositories: PAX pins the fields Compute reads
    (`consumer_contract_for_compute_adapter`), Compute pins its own fixtures; a

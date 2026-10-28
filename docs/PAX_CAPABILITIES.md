@@ -13,6 +13,9 @@ corrected in 0.5.0: Python TOML/requirements/Pipfile are parsed, nested
 `package.json` manifests are components, malformed manifests produce
 diagnostics, Cargo workspaces are read from TOML, and Compose services are
 limited to `services:` children. Pipenv is discovered but not executable.
+Dependency evidence is now layered and reconciled: recognized lockfiles are
+parsed, installed package names are enumerated, and unknown evidence is never
+promoted to a confirmed `drift`.
 
 ## Capabilities by owner
 
@@ -27,16 +30,16 @@ limited to `services:` children. Pipenv is discovered but not executable.
 | Script inspection (package.json `scripts`) | ✅ | keep | PAX | — |
 | Workspace inspection (npm/pnpm, Cargo) | ✅ Cargo workspace membership from metadata or TOML | keep | PAX | — |
 | Container inspection (Dockerfile directives, Compose) | ✅ Compose services are direct children of `services:`; Dockerfile directives are line-scanned | keep | PAX | — |
-| Lockfile inspection | ⚠️ presence only; drift uses substring search for names | presence + explicit "not parsed" | PAX | P1 |
-| Installed-state observation | ⚠️ directory presence only (empty `node_modules/` = present; `target/` is not an install) | rename/limit claims | PAX | P1 |
+| Lockfile inspection | ✅ recognized formats are parsed into package sets (npm v1/v2/v3, pnpm, yarn v1/Berry, bun JSONC, Cargo, uv, poetry, pdm, Pipfile.lock); unparseable/empty/unrecognized files are `unknown` | parse + explicit unknown | PAX | — |
+| Installed-state observation | ✅ JS enumerates `node_modules/` package names (empty = `absent`); Python enumerates `site-packages/` when a conventional environment exists; Rust `target/` is build output and installed state is `unknown` | names + explicit unknown | PAX | — |
 | Runtime observation (`--live`) | ❌ names `docker compose ps`, runs nothing | implement or remove the flag's claim | PAX (if kept) | **P0** (honesty) |
 | Tool detection (is `npm`/`cargo` on PATH, version) | ❌ not implemented (only `cargo` is invoked for metadata) | observation only, with path and version | PAX | P2 |
 | Runtime/platform requirement extraction (`engines`, `requires-python`, `rust-version`, `.nvmrc`) | ❌ none read | declared-requirement observation | PAX | P1 |
 | Project structure observation (`pax observe`: Rust crate/module/file/declaration, bounded, per-fact provenance) | ✅ Rust only; see [PAX_OBSERVATION.md](PAX_OBSERVATION.md) for what it does not observe | keep narrow; no relevance or impact semantics | PAX | — |
-| Declared vs. observed distinction | ⚠️ layers in `reality`; evidence `kind` in `drift`; not in `info`/`deps` | uniform `declared`/`observed` provenance per field | PAX | P1 |
-| Observation provenance (what, where, how) | ✅ file lists for components, graph, reality, drift; native dependencies name their `source`; diagnostics name a check | per-field source references | PAX | — |
+| Declared vs. observed distinction | ✅ separate `declared`/`lockfile`/`installed`/`runtime` facts per dependency in `reality`; evidence `kind` in `drift`; not in `info`/`deps` | uniform per-field provenance | PAX | P1 |
+| Observation provenance (what, where, how) | ✅ file lists for components, graph, reality, drift; every dependency layer names its `source`; diagnostics name a check | per-field source references | PAX | — |
 | Observation time | ❌ none (and intentionally deterministic) | optional, separable from semantic fields | PAX | P2 |
-| Confidence / unknown states | ⚠️ `unknown` in `reality` and live `drift` only | uniform | PAX | P1 |
+| Confidence / unknown states | ✅ `unknown` in `reality` and `drift`; unknown evidence never promotes to confirmed `drift` | uniform | PAX | — |
 | Stable schema/versioning | ⚠️ `schemaVersion: "1"` (info family) vs `schema_version: "1"` (graph/reality/drift); no compatibility policy; execution result `pax.execution-result.v1` is the only self-describing contract | one convention + written policy | PAX | P1 |
 | Normalized project identity | ❌ `project.name` falls back to directory name; `project.root` is an absolute machine path | stable identity without machine paths | PAX | P2 |
 | Tool selection / planning (`--dry-run`) | ✅ | keep | PAX | — |
@@ -66,7 +69,7 @@ contract; **P2** = useful with a concrete consumer; **P3** = defer.
 | Command | Class | Reads | Starts a process | Writes |
 | --- | --- | --- | --- | --- |
 | `info`, `doctor`, `deps`, `scripts`, `workspaces`, `lock` | inspection | manifests, lockfiles | `cargo metadata` (Cargo projects) | nothing |
-| `graph`, `reality`, `drift` (+`--live`) | observation | same, plus directory existence checks | `cargo metadata` (Cargo projects) | nothing |
+| `graph`, `reality`, `drift` (+`--live`) | observation | same, plus lockfile parsing and installed-package enumeration | `cargo metadata` (Cargo projects) | nothing |
 | `--dry-run [--json] <operation>` | plan | same | none (Cargo metadata aside) | nothing |
 | `build`, `test`, `lint`, `typecheck`, `run`, `x`, `exec`, `install`, `add`, `remove`, `deploy` | delegation | same | the selected native tool | whatever that tool writes |
 | `--json test` | delegation + interpretation | same | `cargo test`, or the selected tool | whatever that tool writes |

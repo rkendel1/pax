@@ -376,12 +376,33 @@ fn compose_services_are_limited_to_direct_children_of_services() {
 }
 
 #[test]
-fn known_limitation_empty_node_modules_counts_as_installed() {
+fn empty_node_modules_is_not_reported_as_installed_packages() {
     let root = temp_dir();
     js_project(&root);
     fs::create_dir(root.join("node_modules")).unwrap();
     let reality = json(&root, &["--json", "reality"]);
-    assert_eq!(reality["installed"]["observations"][0]["status"], "present");
+    assert_eq!(reality["installed"]["observations"][0]["status"], "absent");
+    assert_eq!(reality["installed"]["observations"][0]["packageCount"], 0);
+    let dependency = &reality["dependencies"][0];
+    assert_eq!(dependency["name"], "left-pad");
+    assert_eq!(dependency["declared"]["status"], "present");
+    assert_eq!(dependency["lockfile"]["status"], "present");
+    assert_eq!(dependency["installed"]["status"], "absent");
+
+    let drift = json(&root, &["--json", "drift"]);
+    assert_eq!(drift["status"], "drift");
+    assert!(
+        drift["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["subject"] == "./left-pad"
+                && issue["status"] == "drift"
+                && issue["actual"]
+                    .as_str()
+                    .is_some_and(|actual| actual.contains("installed packages"))),
+        "{drift}"
+    );
 }
 
 // 6. The fields Compute's adapter reads (compute-project/src/pax.rs) exist and keep
@@ -435,17 +456,17 @@ fn known_limitation_info_embeds_the_absolute_project_root() {
     assert_eq!(info["project"]["root"], root.display().to_string());
 }
 
-// `unknown` is never promoted to `drift`, but it is promoted to a top-level `ambiguous`
-// (and exit code 2) even though nothing is ambiguous.
+// `unknown` evidence is never promoted to `drift` or to `ambiguous`.
 #[test]
-fn known_limitation_live_unknown_surfaces_as_ambiguous() {
+fn live_unknown_does_not_confirm_a_discrepancy() {
     let root = temp_dir();
     container_project(&root);
     let static_drift = json(&root, &["--json", "drift"]);
     assert_eq!(static_drift["status"], "match");
     let output = pax(&root, &["--json", "drift", "--live"]);
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(0));
     let live: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(live["status"], "ambiguous");
+    assert_eq!(live["status"], "unknown");
+    assert_eq!(live["outcome"], "partial");
     assert_eq!(live["issues"][0]["status"], "unknown");
 }

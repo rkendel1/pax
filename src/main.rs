@@ -45,12 +45,18 @@ fn main() -> ExitCode {
                         .and_then(|value| value["status"].as_str().map(str::to_string))
                 } else if output == "NO DRIFT" {
                     Some("match".to_string())
+                } else if output.starts_with("UNKNOWN") {
+                    Some("unknown".to_string())
+                } else if output.starts_with("AMBIGUOUS") {
+                    Some("ambiguous".to_string())
                 } else {
                     Some("drift".to_string())
                 };
                 match status.as_deref() {
                     Some("drift") => ExitCode::from(1),
                     Some("ambiguous") => ExitCode::from(2),
+                    // Unknown evidence is not a confirmed discrepancy.
+                    Some("unknown") | Some("match") | Some("unsupported") => ExitCode::SUCCESS,
                     _ => ExitCode::SUCCESS,
                 }
             } else {

@@ -13,8 +13,8 @@ project-local files (manifests, lockfiles, workspace files, Dockerfiles, Compose
 files) and, for Cargo projects, the output of `cargo metadata --no-deps
 --offline`, and reports what it found as structured JSON or text: the detected
 ecosystems and package managers, the declared dependencies and scripts, the
-presence of lockfiles and install directories, and the files each statement
-came from. Separately, it can run the project's native tool (`cargo`, `npm`,
+parsed package sets of recognized lockfiles, the package names present in
+conventional install directories, and the files each statement came from. Separately, it can run the project's native tool (`cargo`, `npm`,
 `uv`, …) on request and, for `test`, report what that tool's output lets it
 establish. It does not resolve, install, provision, deploy, or run application
 workloads on its own authority, and it does not know whether a project works.
@@ -23,12 +23,12 @@ workloads on its own authority, and it does not know whether a project works.
 
 | Term | Meaning in PAX | Example |
 | --- | --- | --- |
-| **Observation** | Something PAX directly read at invocation time. | `package.json` exists; `node_modules/` is a directory; `cargo metadata` listed a package. |
+| **Observation** | Something PAX directly read at invocation time. | `package.json` exists; `package-lock.json` parsed into a package set; `node_modules/left-pad` exists; `cargo metadata` listed a package. |
 | **Derivation** | Deterministic computation from observations. | ecosystem = `rust`; selected manager = `pnpm` by `packageManager` field; graph edges. |
 | **Claim** | A statement in PAX output. It is only as strong as the observation or derivation behind it, and should carry the files it came from. | `installed: present` |
 | **Declared** | Stated by a project file, not checked against anything. | `dependencies` in `package.json`. |
 | **Observed** | Seen on this machine now. | a directory exists. |
-| **Reality** | Reserved. PAX output may be called *reality* only if it states what was observed, where, when, how it was derived, declared vs. observed, and what is uncertain. **No PAX output meets this bar today**: nothing is timestamped, uncertainty is expressed only as `unknown` in a few places, and several fields are presence checks (see the audit). The command and field names `reality`, `resolved`, and `installed` are retained for compatibility; read them as "layered presence observations". |
+| **Reality** | Reserved. PAX output may be called *reality* only if it states what was observed, where, when, how it was derived, declared vs. observed, and what is uncertain. **No PAX output meets this bar today**: nothing is timestamped, and installed/runtime layers remain partly unestablished. The command and field names `reality`, `resolved`, and `installed` are retained for compatibility; read them as "layered dependency and presence observations". |
 
 ## Diagram
 
@@ -102,8 +102,8 @@ Two discrepancies with this picture exist today and are documented, not fixed:
 | --- | --- | --- |
 | Execution of workloads | Observation commands never execute anything the project defines. Delegation commands execute the *native tool* the user asked for; PAX does not place, isolate, schedule, meter, or produce execution receipts. | `tests/boundary.rs::observation_commands_execute_no_tool_and_write_nothing` |
 | Package management | PAX replaces none of Cargo, npm, pnpm, yarn, bun, uv, pip, Poetry, PDM. `install`/`add`/`remove` delegate. | `build_install_command`, `build_package_mutation_command` |
-| Dependency resolution | PAX reads declared specifiers, lockfile *presence*, and Cargo's own metadata. It does not solve versions and does not parse lockfiles (drift does a substring search for names). | `build_drift`, `detect_cargo` |
-| Environment management | PAX creates no virtualenv, `node_modules`, toolchain, or container. It checks whether a few conventional directories exist. | `build_reality` |
+| Dependency resolution | PAX reads declared specifiers, parses recognized lockfile package sets, enumerates installed package names, and uses Cargo's own metadata. It does not solve versions or decide whether a lockfile is satisfiable; an unparseable or unrecognized lockfile is `unknown`, never an empty successful set. | `build_drift`, `src/lockfile.rs`, `detect_cargo` |
+| Environment management | PAX creates no virtualenv, `node_modules`, toolchain, or container. It enumerates packages in conventional directories, and reports `unknown` where no conventional environment exists. | `build_reality` |
 | Deployment | `deploy` delegates to `fly`/`vercel`/`netlify` selected from config-file evidence. PAX does not deploy on its own and says nothing about deployability. | `select_deploy_provider` |
 | Runtime management | PAX does not install, select, or probe Node, Python, or Rust versions. `doctor`'s `runtime` field is always `null`. | `detect_node_runtime` |
 | Security / provenance | PAX output is not provenance. A tool selected by name is not verified (no path, hash, or signature is recorded). | no such code exists |

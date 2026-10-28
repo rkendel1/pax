@@ -1,7 +1,7 @@
 {
   "schema": "pax.reality.v1",
   "schema_version": "1",
-  "outcome": "partial",
+  "outcome": "ok",
   "command": "reality",
   "live": false,
   "declared": {
@@ -20,7 +20,9 @@
         "subject": ".",
         "status": "present",
         "source": "filesystem",
-        "evidence": ["pnpm-lock.yaml"]
+        "evidence": ["package-lock.json"],
+        "format": "npm",
+        "packageCount": 1
       }
     ]
   },
@@ -28,12 +30,37 @@
     "observations": [
       {
         "subject": ".",
-        "status": "absent",
+        "status": "present",
         "source": "filesystem",
-        "evidence": ["node_modules/"]
+        "evidence": ["node_modules/"],
+        "packageCount": 1
       }
     ]
   },
   "runtime": { "observations": [] },
+  "dependencies": [
+    {
+      "name": "left-pad",
+      "specifier": "^1.0.0",
+      "kind": "dependency",
+      "ecosystem": "javascript",
+      "component": ".",
+      "declared": {
+        "status": "present",
+        "source": "package.json",
+        "evidence": ["package.json"]
+      },
+      "lockfile": {
+        "status": "present",
+        "source": "package-lock.json",
+        "evidence": ["package-lock.json"]
+      },
+      "installed": {
+        "status": "present",
+        "source": "node_modules/left-pad",
+        "evidence": ["node_modules/left-pad"]
+      }
+    }
+  ],
   "cargo": null
 }

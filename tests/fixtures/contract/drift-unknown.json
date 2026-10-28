@@ -1,0 +1,21 @@
+{
+  "schema": "pax.drift.v1",
+  "schema_version": "1",
+  "outcome": "partial",
+  "command": "drift",
+  "live": false,
+  "status": "unknown",
+  "issues": [
+    {
+      "subject": ".",
+      "status": "unknown",
+      "expected": "lockfile-recorded dependencies",
+      "actual": "package-lock.json could not be interpreted",
+      "evidence": [
+        { "source": "package-lock.json", "kind": "resolved" },
+        { "source": "package.json", "kind": "declared" }
+      ]
+    }
+  ],
+  "cargo": null
+}

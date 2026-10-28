@@ -74,7 +74,8 @@ treats it as success has lost the distinction this contract exists to preserve.
 - `pax observe` retains its historical `status` (`ok` / `partial` / `error`) and
   adds `outcome`.
 - `pax drift` retains its subject-level `status` (`match` / `drift` /
-  `ambiguous` / `unsupported`) and adds `outcome`.
+  `ambiguous` / `unknown` / `unsupported`) and adds `outcome`. `unknown` means
+  the evidence does not establish either a match or a discrepancy.
 - `pax --json test` retains its `pax.execution-result.v1` `status`
   (`passed` / `failed` / `error` / `unsupported` / `ambiguous` / `not_run`).
   It is a result contract, not an observation document, and does not gain
@@ -90,7 +91,7 @@ treats it as success has lost the distinction this contract exists to preserve.
 | `workspaces` | neither JavaScript nor Rust was detected | a Python component is present |
 | `lock` | no JavaScript, Rust, or Python component was detected | multiple Python lockfiles leave no single selected lockfile, or an error-level diagnostic remains |
 | `graph`, `reality` | no component was detected | reality reports an `unknown` layer |
-| `drift` | no component was detected | a live/runtime issue is `unknown` |
+| `drift` | no component was detected | any issue is `unknown` (for example an uninterpretable lockfile or an unestablished installed set) |
 
 An error-level *diagnostic* does not mean the whole command failed; it means the
 command established part of its subject. That is `partial`, not `failed`.
@@ -116,9 +117,9 @@ A fact is not a boolean. These states are distinct and must not be collapsed:
 
 | State | Meaning | Example |
 | --- | --- | --- |
-| `present` | PAX observed the subject as existing. | `node_modules/` is a directory |
-| `absent` | PAX looked and the subject does not exist. This is a successful observation. | `node_modules/` is not present |
-| `unknown` | PAX did not establish the subject. Nothing was observed either way. | a Python environment directory was not found by convention; the environment may exist elsewhere |
+| `present` | PAX observed the subject as existing. | a declared dependency appears in the parsed lockfile package set |
+| `absent` | PAX looked and the subject does not exist. This is a successful observation. | `node_modules/` contains no packages |
+| `unknown` | PAX did not establish the subject. Nothing was observed either way. | a lockfile exists but cannot be interpreted; a Python environment directory was not found by convention |
 | `unsupported` | PAX has no observer for the subject. | `pax observe` source-structure parsing for Python |
 | `blocked` | A bound or precondition prevented the observation. | a `--max-files` limit was exceeded |
 | `failed` | PAX attempted the observation and it did not complete. | an invalid scope request |
@@ -178,6 +179,48 @@ Existing shapes are unchanged:
 - Every inspection `nativeDependencies[]` entry names its declaring
   `source` (a project-relative manifest or requirements file). Graph edges use
   the same file as evidence.
+
+### Dependency evidence in `pax reality`
+
+`pax reality` reports four layers of dependency evidence separately rather than
+collapsing them into one claim:
+
+| Layer | Established by | Never means |
+| --- | --- | --- |
+| `declared` | the manifest names the dependency | that it was resolved or installed |
+| `lockfile` | the parsed lockfile package set records the dependency | that the installed tree matches it |
+| `installed` | a static installed-package directory contains it | that it is complete or runnable |
+| `runtime` | a runtime observer | currently `unknown`; static inspection performs no runtime observation |
+
+Each observation carries a `status` from the fact-state vocabulary. Lockfile
+observations additionally name the `format` (`npm`, `pnpm`, `yarn`, `bun`,
+`cargo`, `uv`, `poetry`, `pdm`, `pipenv`) and the parsed `packageCount` only
+when the package set was actually established. A structurally empty,
+unparseable, or unrecognized lockfile reports `unknown` with a `detail`, never
+an empty successful package set.
+
+`dependencies[]` in `pax reality` combines the layers per declaration:
+
+```json
+{
+  "name": "left-pad",
+  "specifier": "^1.0.0",
+  "kind": "dependency",
+  "ecosystem": "javascript",
+  "component": ".",
+  "declared": { "status": "present", "source": "package.json", "evidence": ["package.json"] },
+  "lockfile": { "status": "present", "source": "package-lock.json", "evidence": ["package-lock.json"] },
+  "installed": { "status": "absent", "source": "node_modules/", "evidence": [] }
+}
+```
+
+`drift` reconciles these facts. It reports `drift` only when an established
+lockfile package set omits a declared reconcilable dependency, or an established
+installed set omits an installed dependency. Unknown evidence produces an
+`unknown` issue and an `unknown` top-level status; it is never promoted to a
+confirmed discrepancy. Peer JavaScript dependencies are excluded from lockfile
+reconciliation because package managers do not install them as ordinary
+dependencies.
 
 ## Entity identities
 
@@ -255,8 +298,9 @@ Fixtures in `tests/fixtures/contract/` are representative documents:
 | `contract.json` | the outcome, state, strength, and identity vocabularies |
 | `info.json` | an inspection document with legacy version and evidence |
 | `graph.json` | project-relative graph identities and edge evidence |
-| `reality.json` | layered presence observations with `absent` |
+| `reality.json` | layered dependency evidence with format, package count, and per-layer facts |
 | `drift.json` | drift subject status plus a successful `outcome` |
+| `drift-unknown.json` | unknown evidence is not a confirmed discrepancy |
 | `observation-partial.json` | `pax.observation.v1` with unsupported diagnostics |
 | `observation-unsupported.json` | an unsupported error is not success |
 | `plan.json` | a plan schema without an outcome |
