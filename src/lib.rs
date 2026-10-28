@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -140,6 +141,9 @@ enum Operation {
     Add,
     Remove,
     Deploy,
+    Run(String),
+    X,
+    Exec,
     Custom(String),
 }
 
@@ -154,9 +158,106 @@ impl Operation {
             Self::Add => "add".to_string(),
             Self::Remove => "remove".to_string(),
             Self::Deploy => "deploy".to_string(),
+            Self::Run(_) => "run".to_string(),
+            Self::X => "x".to_string(),
+            Self::Exec => "exec".to_string(),
             Self::Custom(name) => format!("custom:{name}"),
         }
     }
+}
+
+/// Stable machine codes for operations PAX refuses to map to a native command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum UnsupportedReason {
+    NoNativeMapping,
+    MissingProjectScript,
+    MissingProjectConfiguration,
+    UnsupportedEcosystem,
+    UnsupportedTool,
+    NoAuthoritativeTool,
+    NoRootProject,
+    UnknownComposeService,
+    PipenvUnsupported,
+    MissingTarget,
+}
+
+/// Typed explanation for a capability that has no valid native mapping.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnsupportedOperation {
+    pub operation: String,
+    pub ecosystem: Option<String>,
+    pub tool: Option<String>,
+    pub reason: UnsupportedReason,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+}
+
+impl UnsupportedOperation {
+    fn render(&self) -> String {
+        match &self.guidance {
+            Some(guidance) => format!("{}\n{guidance}", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ResolveError {
+    Unsupported(UnsupportedOperation),
+    Cli(CliError),
+}
+
+impl From<CliError> for ResolveError {
+    fn from(error: CliError) -> Self {
+        Self::Cli(error)
+    }
+}
+
+impl ResolveError {
+    fn into_cli_error(self) -> CliError {
+        match self {
+            Self::Unsupported(error) => CliError {
+                message: error.render(),
+                exit_code: 2,
+            },
+            Self::Cli(error) => error,
+        }
+    }
+
+    fn into_unsupported(self, operation: &Operation) -> UnsupportedOperation {
+        match self {
+            Self::Unsupported(error) => error,
+            Self::Cli(error) => UnsupportedOperation {
+                operation: operation.name(),
+                ecosystem: None,
+                tool: None,
+                reason: UnsupportedReason::NoNativeMapping,
+                message: error.message,
+                guidance: None,
+            },
+        }
+    }
+}
+
+fn unsupported(
+    operation: &Operation,
+    ecosystem: Option<&str>,
+    tool: Option<&str>,
+    reason: UnsupportedReason,
+    message: impl Into<String>,
+    guidance: Option<String>,
+) -> ResolveError {
+    ResolveError::Unsupported(UnsupportedOperation {
+        operation: operation.name(),
+        ecosystem: ecosystem.map(str::to_string),
+        tool: tool.map(str::to_string),
+        reason,
+        message: message.into(),
+        guidance,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -529,7 +630,7 @@ struct ExecutionPlan {
     schema: &'static str,
     operation: String,
     ecosystem: String,
-    tool: String,
+    tool: Option<String>,
     runner: String,
     command: Vec<String>,
     evidence: Vec<String>,
@@ -538,6 +639,8 @@ struct ExecutionPlan {
     workspace: Option<String>,
     environment: BTreeMap<String, String>,
     supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsupported: Option<UnsupportedOperation>,
     selection_reason: String,
 }
 
@@ -587,27 +690,14 @@ where
     S: Into<String>,
 {
     let cli = parse_args(args)?;
-    if cli.live && !matches!(cli.command, CommandName::Reality | CommandName::Drift) {
-        return Err(CliError {
-            message: "--live applies only to `pax reality` and `pax drift`".to_string(),
-            exit_code: 2,
-        });
-    }
-    if cli.json && !cli.dry_run && matches!(cli.command, CommandName::Test) {
-        return execute_with_result(&cli, Operation::Test);
+    validate_flags(&cli)?;
+    if cli.json && !cli.dry_run && command_executes(cli.command) {
+        return execute_with_result(&cli);
     }
     let working_directory = resolve_working_directory(&cli)?;
 
     if let CommandName::Observe = cli.command {
         return observe::observe(&working_directory, &cli.observe, cli.json);
-    }
-    if !cli.observe.is_empty() {
-        return Err(CliError {
-            message:
-                "--scope, --max-files, --max-bytes, and --max-facts apply only to `pax observe`"
-                    .to_string(),
-            exit_code: 2,
-        });
     }
 
     if let CommandName::Exec = cli.command {
@@ -623,6 +713,7 @@ where
             },
             cli.dry_run,
             cli.json,
+            cli.timeout,
         );
     }
     let detection = detect_repository(&working_directory)?;
@@ -643,7 +734,7 @@ where
         CommandName::Test => Some(Operation::Test),
         CommandName::Lint => Some(Operation::Lint),
         CommandName::Typecheck => Some(Operation::Typecheck),
-        CommandName::Run => Some(Operation::Custom(cli.run_args[0].clone())),
+        CommandName::Run => Some(Operation::Run(cli.run_args[0].clone())),
         CommandName::Install => Some(Operation::Install),
         CommandName::Add => Some(Operation::Add),
         CommandName::Remove => Some(Operation::Remove),
@@ -657,12 +748,35 @@ where
             &cli.run_args[..]
         };
         let resolved =
-            resolve_operation(&detection, operation, operation_args, cli.tool.as_deref())?;
-        return dispatch_resolved_operation(resolved, &detection, cli.dry_run, cli.json);
+            match resolve_operation(&detection, &operation, operation_args, cli.tool.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(error) if cli.dry_run => {
+                    return dispatch_unsupported_plan(&detection, &operation, error, cli.json);
+                }
+                Err(error) => return Err(error.into_cli_error()),
+            };
+        return dispatch_resolved_operation(
+            resolved,
+            &detection,
+            cli.dry_run,
+            cli.json,
+            cli.timeout,
+        );
     }
     if let CommandName::X = cli.command {
-        let command = build_x_command(&detection, &cli.run_args, cli.tool.as_deref())?;
-        return dispatch_execution(command, cli.dry_run, cli.json);
+        let command = match build_x_command(&detection, &cli.run_args, cli.tool.as_deref()) {
+            Ok(command) => command,
+            Err(error) if cli.dry_run => {
+                return dispatch_unsupported_plan(
+                    &detection,
+                    &Operation::X,
+                    error,
+                    cli.json,
+                );
+            }
+            Err(error) => return Err(error.into_cli_error()),
+        };
+        return dispatch_execution(command, cli.dry_run, cli.json, cli.timeout);
     }
     let output = match cli.command {
         CommandName::Build => unreachable!(),
@@ -695,6 +809,75 @@ where
     } else {
         Ok(render_human(&output))
     }
+}
+
+fn command_executes(command: CommandName) -> bool {
+    matches!(
+        command,
+        CommandName::Build
+            | CommandName::Test
+            | CommandName::Lint
+            | CommandName::Typecheck
+            | CommandName::Run
+            | CommandName::X
+            | CommandName::Install
+            | CommandName::Add
+            | CommandName::Remove
+            | CommandName::Exec
+            | CommandName::Deploy
+    )
+}
+
+fn command_accepts_tool(command: CommandName) -> bool {
+    matches!(
+        command,
+        CommandName::Build
+            | CommandName::Test
+            | CommandName::Lint
+            | CommandName::Typecheck
+            | CommandName::Run
+            | CommandName::X
+            | CommandName::Install
+            | CommandName::Add
+            | CommandName::Remove
+            | CommandName::Deploy
+    )
+}
+
+fn validate_flags(cli: &ParsedCli) -> Result<(), CliError> {
+    if cli.live && !matches!(cli.command, CommandName::Reality | CommandName::Drift) {
+        return Err(CliError {
+            message: "--live applies only to `pax reality` and `pax drift`".to_string(),
+            exit_code: 2,
+        });
+    }
+    if !cli.observe.is_empty() && !matches!(cli.command, CommandName::Observe) {
+        return Err(CliError {
+            message:
+                "--scope, --max-files, --max-bytes, and --max-facts apply only to `pax observe`"
+                    .to_string(),
+            exit_code: 2,
+        });
+    }
+    if cli.dry_run && !command_executes(cli.command) {
+        return Err(CliError {
+            message: "--dry-run applies only to execution commands".to_string(),
+            exit_code: 2,
+        });
+    }
+    if cli.timeout.is_some() && !command_executes(cli.command) {
+        return Err(CliError {
+            message: "--timeout applies only to execution commands".to_string(),
+            exit_code: 2,
+        });
+    }
+    if cli.tool.is_some() && !command_accepts_tool(cli.command) {
+        return Err(CliError {
+            message: "--tool applies only to commands that select a native tool".to_string(),
+            exit_code: 2,
+        });
+    }
+    Ok(())
 }
 
 fn resolve_working_directory(cli: &ParsedCli) -> Result<PathBuf, CliError> {
@@ -2816,6 +2999,7 @@ struct ParsedCli {
     dir: Option<PathBuf>,
     dry_run: bool,
     live: bool,
+    timeout: Option<Duration>,
     observe: observe::ObserveOptions,
 }
 
@@ -2868,6 +3052,7 @@ where
     let mut live = false;
     let mut tool = None;
     let mut dir = None;
+    let mut timeout = None;
     let mut observe = observe::ObserveOptions::default();
     let mut filtered = Vec::with_capacity(args.len());
     let mut index = 0;
@@ -2916,6 +3101,14 @@ where
                 "--max-bytes" => observe.max_bytes = Some(value),
                 _ => observe.max_facts = Some(value),
             }
+        } else if options && arg == "--timeout" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| CliError {
+                message: "pax --timeout requires a duration (for example 30s or 500ms)"
+                    .to_string(),
+                exit_code: 2,
+            })?;
+            timeout = Some(parse_timeout(value)?);
         } else if options && arg == "--dir" {
             index += 1;
             dir = Some(PathBuf::from(args.get(index).ok_or_else(|| CliError {
@@ -3022,8 +3215,41 @@ where
         dir,
         dry_run,
         live,
+        timeout,
         observe,
     })
+}
+
+fn parse_timeout(value: &str) -> Result<Duration, CliError> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        (value, 1_000)
+    };
+    let amount = number.parse::<u64>().map_err(|_| CliError {
+        message: format!(
+            "invalid --timeout value '{value}': use a positive integer with an optional ms, s, m, or h suffix"
+        ),
+        exit_code: 2,
+    })?;
+    let millis = amount.checked_mul(multiplier).ok_or_else(|| CliError {
+        message: format!("invalid --timeout value '{value}': duration is too large"),
+        exit_code: 2,
+    })?;
+    if millis == 0 {
+        return Err(CliError {
+            message: "invalid --timeout value '0': the timeout must be greater than zero"
+                .to_string(),
+            exit_code: 2,
+        });
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn usage() -> String {
@@ -3043,8 +3269,9 @@ Execution (delegated to native tools):
 Options:
   --dir <path>       select the project root
   --tool <tool>      explicitly select the native tool
-  --dry-run          preview a delegated command without executing it
+  --dry-run          preview a delegated command without executing it (execution commands only)
   --json             emit machine-readable output for automation
+  --timeout <dur>    terminate a delegated command after dur (30s, 500ms, 2m; execution commands only)
   --live             allow runtime observations for reality/drift
   --scope <scope>    observe: project (default), crate:<pkg>, module:<id>, file:<path>, path:<prefix>
   --max-files <n>    observe: bound on files read and directory entries listed (default 200)
@@ -3134,77 +3361,134 @@ fn build_x_command(
     detection: &RepositoryDetection,
     run_args: &[String],
     override_tool: Option<&str>,
-) -> Result<RunCommand, CliError> {
-    let package = run_args.first().ok_or_else(|| CliError {
-        message: format!("pax x requires a package\n\n{}", usage()),
-        exit_code: 2,
+) -> Result<RunCommand, ResolveError> {
+    let package = run_args.first().ok_or_else(|| {
+        unsupported(
+            &Operation::X,
+            None,
+            override_tool,
+            UnsupportedReason::MissingTarget,
+            "pax x requires a package",
+            Some(format!("Usage: pax x <package> [args...]")),
+        )
     })?;
     let mut args = run_args.to_vec();
     if package == "install" {
-        return build_install_command(detection, &args[1..], override_tool);
+        return build_install_command(
+            detection,
+            &args[1..],
+            override_tool,
+            &Operation::Install,
+        );
     }
-    let program = if let Some(tool) = override_tool {
+    let (program, ecosystem) = if let Some(tool) = override_tool {
         match tool {
-            "npm" => "npx",
+            "npm" => ("npx", "javascript"),
             "pnpm" => {
                 args.insert(0, "dlx".to_string());
-                "pnpm"
+                ("pnpm", "javascript")
             }
-            "bun" => "bunx",
+            "bun" => ("bunx", "javascript"),
             "yarn" => {
                 args.insert(0, "dlx".to_string());
-                "yarn"
+                ("yarn", "javascript")
             }
-            "uv" => "uvx",
-            "pip" => "pipx",
+            "uv" => ("uvx", "python"),
+            "pip" => ("pipx", "python"),
+            "poetry" | "pdm" => {
+                return Err(unsupported(
+                    &Operation::X,
+                    Some("python"),
+                    Some(tool),
+                    UnsupportedReason::NoNativeMapping,
+                    format!("{tool} has no ephemeral package runner"),
+                    Some(
+                        "Use `pax run <tool>` for a project tool, or select `--tool uv` or `--tool pip`.".to_string(),
+                    ),
+                ));
+            }
+            "pipenv" => {
+                return Err(unsupported(
+                    &Operation::X,
+                    Some("python"),
+                    Some(tool),
+                    UnsupportedReason::PipenvUnsupported,
+                    "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                    Some("Use `--tool uv`, `--tool pip`, or `pax run <target>`.".to_string()),
+                ));
+            }
             _ => {
-                return Err(CliError {
-                    message: format!("unsupported package runner tool: {tool}"),
-                    exit_code: 2,
-                });
+                return Err(unsupported(
+                    &Operation::X,
+                    None,
+                    Some(tool),
+                    UnsupportedReason::UnsupportedTool,
+                    format!("unsupported package runner tool: {tool}"),
+                    None,
+                ));
             }
         }
     } else if let Some(manager) = detection.manager.as_ref() {
         match manager.name {
-            PackageManager::Npm => "npx",
+            PackageManager::Npm => ("npx", "javascript"),
             PackageManager::Pnpm => {
                 args.insert(0, "dlx".to_string());
-                "pnpm"
+                ("pnpm", "javascript")
             }
-
-            PackageManager::Bun => "bunx",
+            PackageManager::Bun => ("bunx", "javascript"),
             PackageManager::Yarn => {
                 args.insert(0, "dlx".to_string());
-                "yarn"
+                ("yarn", "javascript")
             }
         }
-    } else if let Some(component) = detection
-        .components
-        .iter()
-        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
-    {
+    } else if let Some(component) = root_component(detection, Ecosystem::Python) {
         match component.tool.as_deref() {
-            Some("uv") => "uvx",
-            Some("poetry" | "pdm" | "pip") => "pipx",
+            Some("uv") => ("uvx", "python"),
+            Some("pip") => ("pipx", "python"),
+            Some("poetry" | "pdm") => {
+                return Err(unsupported(
+                    &Operation::X,
+                    Some("python"),
+                    component.tool.as_deref(),
+                    UnsupportedReason::NoNativeMapping,
+                    "the selected Python tool has no ephemeral package runner",
+                    Some(
+                        "Use `--tool uv` or `--tool pip` to select a package runner.".to_string(),
+                    ),
+                ));
+            }
             Some("pipenv") => {
-                return Err(CliError {
-                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                    exit_code: 2,
-                });
+                return Err(unsupported(
+                    &Operation::X,
+                    Some("python"),
+                    component.tool.as_deref(),
+                    UnsupportedReason::PipenvUnsupported,
+                    "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                    Some("Use `--tool uv`, `--tool pip`, or `pax run <target>`.".to_string()),
+                ));
             }
             _ => {
-                return Err(CliError {
-                    message: "could not detect an authoritative package runner".to_string(),
-                    exit_code: 1,
-                });
+                return Err(unsupported(
+                    &Operation::X,
+                    Some("python"),
+                    component.tool.as_deref(),
+                    UnsupportedReason::NoAuthoritativeTool,
+                    "could not detect an authoritative package runner",
+                    Some("Use `--tool` to select a package runner.".to_string()),
+                ));
             }
         }
     } else {
-        return Err(CliError {
-            message: "could not detect an authoritative package runner".to_string(),
-            exit_code: 1,
-        });
+        return Err(unsupported(
+            &Operation::X,
+            None,
+            None,
+            UnsupportedReason::NoAuthoritativeTool,
+            "could not detect an authoritative package runner",
+            Some("Use `--tool` to select a package runner.".to_string()),
+        ));
     };
+    let _ = ecosystem;
     let _ = package;
     Ok(RunCommand {
         program: program.to_string(),
@@ -3217,98 +3501,126 @@ fn build_install_command(
     detection: &RepositoryDetection,
     install_args: &[String],
     override_tool: Option<&str>,
-) -> Result<RunCommand, CliError> {
-    if let Some(tool) = override_tool {
-        if !matches!(tool, "npm" | "pnpm" | "bun" | "yarn") {
-            return build_python_install_command(detection, install_args, tool);
-        }
-
-        let mut args = vec!["install".to_string()];
-        args.extend(install_args.iter().cloned());
-        return Ok(RunCommand {
-            program: tool.to_string(),
-            args,
-            working_directory: detection.root.clone(),
-        });
-    }
-
-    fn build_python_install_command(
-        detection: &RepositoryDetection,
-        install_args: &[String],
-        tool: &str,
-    ) -> Result<RunCommand, CliError> {
-        let mut args = Vec::new();
-        let program = match tool {
-            "uv" => {
-                args.push("pip".to_string());
-                "uv"
-            }
-            "pip" => "pip",
-            "poetry" => "poetry",
-            "pdm" => "pdm",
-            "pipenv" => {
-                return Err(CliError {
-                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                    exit_code: 2,
-                });
-            }
-            _ => {
-                return Err(CliError {
-                    message: format!("unsupported package manager tool: {tool}"),
-                    exit_code: 2,
-                });
-            }
-        };
-        args.push("install".to_string());
-        args.extend(install_args.iter().cloned());
-        Ok(RunCommand {
-            program: program.to_string(),
-            args,
-            working_directory: detection.root.clone(),
+    operation: &Operation,
+) -> Result<RunCommand, ResolveError> {
+    let tool = override_tool
+        .map(str::to_string)
+        .or_else(|| {
+            detection
+                .manager
+                .as_ref()
+                .map(|manager| manager.name.display_name().to_string())
         })
-    }
-    if let Some(manager) = detection.manager.as_ref() {
+        .or_else(|| {
+            root_component(detection, Ecosystem::Python)
+                .and_then(|component| component.tool.clone())
+        })
+        .or_else(|| {
+            root_component(detection, Ecosystem::Rust)
+                .and_then(|component| component.tool.clone())
+        })
+        .or_else(|| {
+            root_component(detection, Ecosystem::Container)
+                .and_then(|component| component.tool.clone())
+        })
+        .ok_or_else(|| {
+            unsupported(
+                operation,
+                None,
+                None,
+                UnsupportedReason::NoAuthoritativeTool,
+                "could not detect an authoritative package manager",
+                Some("Use `--tool` to select a native package manager.".to_string()),
+            )
+        })?;
+
+    if PackageManager::parse(&tool).is_some() {
         let mut args = vec!["install".to_string()];
         args.extend(install_args.iter().cloned());
         return Ok(RunCommand {
-            program: manager.name.display_name().to_string(),
+            program: tool,
             args,
             working_directory: detection.root.clone(),
         });
     }
 
-    let component = detection
-        .components
-        .iter()
-        .find(|component| component.path == "." && component.ecosystem == Ecosystem::Python)
-        .ok_or_else(|| CliError {
-            message: "could not detect an authoritative package manager".to_string(),
-            exit_code: 1,
-        })?;
     let mut args = Vec::new();
-    let program = match component.tool.as_deref() {
-        Some("uv") => {
+    let program = match tool.as_str() {
+        "uv" => {
             args.push("pip".to_string());
             "uv"
         }
-        Some("poetry") => "poetry",
-        Some("pdm") => "pdm",
-        Some("pip") => "pip",
-        Some("pipenv") => {
-            return Err(CliError {
-                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                exit_code: 2,
-            });
+        "pip" => "pip",
+        "poetry" => "poetry",
+        "pdm" => "pdm",
+        "pipenv" => {
+            return Err(unsupported(
+                operation,
+                Some("python"),
+                Some(&tool),
+                UnsupportedReason::PipenvUnsupported,
+                "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                Some("Use `pax run <target>` or an explicit `pax exec` command.".to_string()),
+            ));
+        }
+        "cargo" => {
+            return Err(unsupported(
+                operation,
+                Some("rust"),
+                Some(&tool),
+                UnsupportedReason::NoNativeMapping,
+                "Cargo has no command that installs an arbitrary named dependency into the current project",
+                Some("Use `pax add <package>` to change Cargo.toml.".to_string()),
+            ));
+        }
+        "docker" => {
+            return Err(unsupported(
+                operation,
+                Some("docker"),
+                Some(&tool),
+                UnsupportedReason::NoNativeMapping,
+                "Docker has no package-install operation",
+                Some("Use `pax install` in a Compose project to pull declared images, or `pax exec docker ...`.".to_string()),
+            ));
         }
         _ => {
-            return Err(CliError {
-                message: "could not detect an authoritative package manager".to_string(),
-                exit_code: 1,
-            });
+            return Err(unsupported(
+                operation,
+                None,
+                Some(&tool),
+                UnsupportedReason::UnsupportedTool,
+                format!("unsupported package manager tool: {tool}"),
+                None,
+            ));
         }
     };
-    args.push("install".to_string());
-    args.extend(install_args.iter().cloned());
+
+    if install_args.is_empty() {
+        match tool.as_str() {
+            "uv" => return resolve_root_install_command(detection, override_tool, operation),
+            "poetry" | "pdm" => args.push("install".to_string()),
+            "pip" => {
+                args.extend(["install".to_string(), ".".to_string()]);
+            }
+            _ => unreachable!(),
+        }
+    } else if tool == "poetry" || tool == "pdm" {
+        return Err(unsupported(
+            operation,
+            Some("python"),
+            Some(&tool),
+            UnsupportedReason::NoNativeMapping,
+            format!("{tool} cannot install a named package without changing project declarations"),
+            Some(format!(
+                "Use `pax add <package>` to change the project, or `pax exec {tool} run pip install <package>`."
+            )),
+        ));
+    } else {
+        args.push("install".to_string());
+        args.extend(install_args.iter().cloned());
+    }
+
+    let _ = component;
     Ok(RunCommand {
         program: program.to_string(),
         args,
@@ -3320,15 +3632,18 @@ fn build_package_mutation_command(
     detection: &RepositoryDetection,
     args: &[String],
     override_tool: Option<&str>,
-    add: bool,
-) -> Result<RunCommand, CliError> {
-    let package = args.first().ok_or_else(|| CliError {
-        message: format!(
-            "pax {} requires a package\n\n{}",
-            if add { "add" } else { "remove" },
-            usage()
-        ),
-        exit_code: 2,
+    operation: &Operation,
+) -> Result<RunCommand, ResolveError> {
+    let add = matches!(operation, Operation::Add);
+    let package = args.first().ok_or_else(|| {
+        unsupported(
+            operation,
+            None,
+            override_tool,
+            UnsupportedReason::MissingTarget,
+            format!("pax {} requires a package", operation.name()),
+            Some(usage()),
+        )
     })?;
     let inferred_tool = detection.components.iter().find_map(|component| {
         (component.path == "."
@@ -3337,40 +3652,80 @@ fn build_package_mutation_command(
         .flatten()
     });
     let tool = override_tool
+        .map(str::to_string)
         .or_else(|| {
             detection
                 .manager
                 .as_ref()
-                .map(|manager| manager.name.display_name())
+                .map(|manager| manager.name.display_name().to_string())
         })
-        .or(inferred_tool)
-        .ok_or_else(|| CliError {
-            message: "could not determine an authoritative package tool; use --tool".to_string(),
-            exit_code: 1,
+        .or_else(|| inferred_tool.map(str::to_string))
+        .ok_or_else(|| {
+            unsupported(
+                operation,
+                None,
+                None,
+                UnsupportedReason::NoAuthoritativeTool,
+                "could not determine an authoritative package tool",
+                Some("Use `--tool` to select a native package manager.".to_string()),
+            )
         })?;
     let mut command_args = args.to_vec();
-    let (program, operation) = match tool {
-        "npm" => ("npm", if add { "install" } else { "uninstall" }),
-        "pnpm" => ("pnpm", if add { "add" } else { "remove" }),
-        "yarn" => ("yarn", if add { "add" } else { "remove" }),
-        "bun" => ("bun", if add { "add" } else { "remove" }),
-        "uv" => ("uv", if add { "add" } else { "remove" }),
-        "cargo" => ("cargo", if add { "add" } else { "remove" }),
+    let (program, native_operation, ecosystem) = match tool.as_str() {
+        "npm" => ("npm", if add { "install" } else { "uninstall" }, "javascript"),
+        "pnpm" => ("pnpm", if add { "add" } else { "remove" }, "javascript"),
+        "yarn" => ("yarn", if add { "add" } else { "remove" }, "javascript"),
+        "bun" => ("bun", if add { "add" } else { "remove" }, "javascript"),
+        "uv" => ("uv", if add { "add" } else { "remove" }, "python"),
+        "cargo" => ("cargo", if add { "add" } else { "remove" }, "rust"),
+        "poetry" => ("poetry", if add { "add" } else { "remove" }, "python"),
+        "pdm" => ("pdm", if add { "add" } else { "remove" }, "python"),
+        "pip" => {
+            return Err(unsupported(
+                operation,
+                Some("python"),
+                Some(&tool),
+                UnsupportedReason::NoNativeMapping,
+                "pip cannot change project dependency declarations",
+                Some(
+                    "Use `pax install` for a named package, or select `--tool uv`, `--tool poetry`, or `--tool pdm`."
+                        .to_string(),
+                ),
+            ));
+        }
         "pipenv" => {
-            return Err(CliError {
-                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                exit_code: 2,
-            });
+            return Err(unsupported(
+                operation,
+                Some("python"),
+                Some(&tool),
+                UnsupportedReason::PipenvUnsupported,
+                "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                Some("Use `pax run <target>` or an explicit `pax exec` command.".to_string()),
+            ));
+        }
+        "docker" => {
+            return Err(unsupported(
+                operation,
+                Some("docker"),
+                Some(&tool),
+                UnsupportedReason::NoNativeMapping,
+                "Docker has no dependency mutation operation",
+                Some("Edit the Compose or Dockerfile declarations directly.".to_string()),
+            ));
         }
         _ => {
-            return Err(CliError {
-                message: format!("unsupported canonical package operation for {tool}"),
-                exit_code: 1,
-            });
+            return Err(unsupported(
+                operation,
+                None,
+                Some(&tool),
+                UnsupportedReason::UnsupportedTool,
+                format!("unsupported canonical package operation for {tool}"),
+                Some("Use `--tool` to select a supported package manager.".to_string()),
+            ));
         }
     };
-    command_args.insert(0, operation.to_string());
-    let _ = package;
+    command_args.insert(0, native_operation.to_string());
+    let _ = (package, ecosystem);
     Ok(RunCommand {
         program: program.to_string(),
         args: command_args,
@@ -3380,36 +3735,33 @@ fn build_package_mutation_command(
 
 fn resolve_operation(
     detection: &RepositoryDetection,
-    operation: Operation,
+    operation: &Operation,
     args: &[String],
     override_tool: Option<&str>,
-) -> Result<ResolvedOperation, CliError> {
+) -> Result<ResolvedOperation, ResolveError> {
     let mut ecosystem = None;
     let mut evidence = Vec::new();
     let mut operation_selection_reason = None;
-    let command = match &operation {
+    let command = match operation {
         Operation::Build | Operation::Test | Operation::Lint | Operation::Typecheck => {
-            resolve_standard_project_command(detection, &operation.name(), args, override_tool)?
+            resolve_standard_project_command(detection, operation, args, override_tool)?
         }
-        Operation::Custom(name) => {
+        Operation::Run(name) | Operation::Custom(name) => {
             let run_args = std::iter::once(name.clone())
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>();
-            build_run_command(detection, &run_args, override_tool)?
+            build_run_command(detection, &run_args, override_tool, operation)?
         }
         Operation::Install => {
             if args.is_empty() {
-                resolve_root_install_command(detection, override_tool)?
+                resolve_root_install_command(detection, override_tool, operation)?
             } else {
-                build_install_command(detection, args, override_tool)?
+                build_install_command(detection, args, override_tool, operation)?
             }
         }
-        Operation::Add | Operation::Remove => build_package_mutation_command(
-            detection,
-            args,
-            override_tool,
-            matches!(operation, Operation::Add),
-        )?,
+        Operation::Add | Operation::Remove => {
+            build_package_mutation_command(detection, args, override_tool, operation)?
+        }
         Operation::Deploy => {
             let selection = select_deploy_provider(detection, override_tool)?;
             let (program, canonical) = selection.provider.command();
@@ -3434,6 +3786,9 @@ fn resolve_operation(
                 working_directory: detection.root.clone(),
             }
         }
+        Operation::X | Operation::Exec => {
+            unreachable!("x and exec are resolved by their dedicated paths")
+        }
     };
     let selection_reason = operation_selection_reason.unwrap_or_else(|| {
         if let Some(tool) = override_tool {
@@ -3451,7 +3806,7 @@ fn resolve_operation(
         }
     });
     Ok(ResolvedOperation {
-        operation,
+        operation: operation.clone(),
         command,
         selection_reason,
         ecosystem,
@@ -3459,111 +3814,662 @@ fn resolve_operation(
     })
 }
 
+fn root_component(
+    detection: &RepositoryDetection,
+    ecosystem: Ecosystem,
+) -> Option<&Component> {
+    detection
+        .components
+        .iter()
+        .find(|component| component.path == "." && component.ecosystem == ecosystem)
+}
+
+fn ecosystem_name(ecosystem: Ecosystem) -> Option<&'static str> {
+    match ecosystem {
+        Ecosystem::JavaScript => Some("javascript"),
+        Ecosystem::Python => Some("python"),
+        Ecosystem::Rust => Some("rust"),
+        Ecosystem::Container => Some("docker"),
+    }
+}
+
+fn has_compose_file(component: &Component) -> bool {
+    component.manifests.iter().any(|manifest| {
+        matches!(
+            manifest.as_str(),
+            "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml"
+        )
+    })
+}
+
+fn has_dockerfile(component: &Component) -> bool {
+    component
+        .manifests
+        .iter()
+        .any(|manifest| manifest == "Dockerfile" || manifest.starts_with("Dockerfile."))
+}
+
+fn resolve_docker_operation(
+    detection: &RepositoryDetection,
+    operation: &Operation,
+    extra_args: &[String],
+) -> Result<RunCommand, ResolveError> {
+    let component = root_component(detection, Ecosystem::Container).ok_or_else(|| {
+        unsupported(
+            operation,
+            Some("docker"),
+            Some("docker"),
+            UnsupportedReason::NoRootProject,
+            "no Docker or Compose project was detected at the project root",
+            Some("Run PAX from the directory that contains the Compose file or Dockerfile.".to_string()),
+        )
+    })?;
+    let compose = has_compose_file(component);
+    match operation {
+        Operation::Build => {
+            if compose {
+                Ok(RunCommand {
+                    program: "docker".to_string(),
+                    args: ["compose", "build"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain(extra_args.iter().cloned())
+                        .collect(),
+                    working_directory: detection.root.clone(),
+                })
+            } else if has_dockerfile(component) {
+                Ok(RunCommand {
+                    program: "docker".to_string(),
+                    args: ["build", "."]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain(extra_args.iter().cloned())
+                        .collect(),
+                    working_directory: detection.root.clone(),
+                })
+            } else {
+                Err(unsupported(
+                    operation,
+                    Some("docker"),
+                    Some("docker"),
+                    UnsupportedReason::NoNativeMapping,
+                    "no Compose file or Dockerfile is available to build",
+                    Some("Add a Compose file or Dockerfile.".to_string()),
+                ))
+            }
+        }
+        Operation::Install => {
+            if compose {
+                Ok(RunCommand {
+                    program: "docker".to_string(),
+                    args: ["compose", "pull"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain(extra_args.iter().cloned())
+                        .collect(),
+                    working_directory: detection.root.clone(),
+                })
+            } else {
+                Err(unsupported(
+                    operation,
+                    Some("docker"),
+                    Some("docker"),
+                    UnsupportedReason::NoNativeMapping,
+                    "Dockerfile-only projects have no dependency-install operation",
+                    Some("Use `pax exec docker build ...` or add a Compose file.".to_string()),
+                ))
+            }
+        }
+        Operation::Test | Operation::Lint | Operation::Typecheck => Err(unsupported(
+            operation,
+            Some("docker"),
+            Some("docker"),
+            UnsupportedReason::NoNativeMapping,
+            format!(
+                "Docker Compose has no '{}' operation",
+                operation.name()
+            ),
+            Some(format!(
+                "Use an explicit Compose service with `pax run <service>` or `pax exec docker compose ...`."
+            )),
+        )),
+        _ => unreachable!("only standard project operations reach the Docker matrix"),
+    }
+}
+
+fn resolve_docker_run(
+    detection: &RepositoryDetection,
+    target: &str,
+    extra_args: &[String],
+    operation: &Operation,
+) -> Result<RunCommand, ResolveError> {
+    let component = root_component(detection, Ecosystem::Container).ok_or_else(|| {
+        unsupported(
+            operation,
+            Some("docker"),
+            Some("docker"),
+            UnsupportedReason::NoRootProject,
+            "no Docker or Compose project was detected at the project root",
+            Some("Run PAX from the directory that contains the Compose file.".to_string()),
+        )
+    })?;
+    if !has_compose_file(component) {
+        return Err(unsupported(
+            operation,
+            Some("docker"),
+            Some("docker"),
+            UnsupportedReason::NoNativeMapping,
+            "Dockerfile-only projects have no service or Compose operation to run",
+            Some(
+                "Use `pax exec docker build ...` or `pax exec docker run ...` explicitly.".to_string(),
+            ),
+        ));
+    }
+    const COMPOSE_OPERATIONS: [&str; 16] = [
+        "build", "config", "down", "images", "logs", "pause", "ps", "pull", "restart", "start",
+        "stop", "top", "unpause", "up", "version", "wait",
+    ];
+    if COMPOSE_OPERATIONS.contains(&target) {
+        return Ok(RunCommand {
+            program: "docker".to_string(),
+            args: ["compose", target]
+                .into_iter()
+                .map(str::to_string)
+                .chain(extra_args.iter().cloned())
+                .collect(),
+            working_directory: detection.root.clone(),
+        });
+    }
+    if let Some(container) = detection.container.as_ref()
+        && !container.services.is_empty()
+        && !container.services.iter().any(|service| service == target)
+    {
+        return Err(unsupported(
+            operation,
+            Some("docker"),
+            Some("docker"),
+            UnsupportedReason::UnknownComposeService,
+            format!("Compose service '{target}' is not declared"),
+            Some(format!(
+                "Declared services: {}. Use `pax run <service>` or an explicit `pax exec docker compose ...` command.",
+                container.services.join(", ")
+            )),
+        ));
+    }
+    Ok(RunCommand {
+        program: "docker".to_string(),
+        args: ["compose", "run", "--rm", target]
+            .into_iter()
+            .map(str::to_string)
+            .chain(extra_args.iter().cloned())
+            .collect(),
+        working_directory: detection.root.clone(),
+    })
+}
+
+#[derive(Default)]
+struct PythonProjectEvidence {
+    build: Vec<String>,
+    test: Vec<String>,
+    lint: Vec<String>,
+    typecheck: Vec<String>,
+}
+
+fn resolve_python_operation(
+    detection: &RepositoryDetection,
+    operation: &Operation,
+    extra_args: &[String],
+    tool: &str,
+) -> Result<RunCommand, ResolveError> {
+    if tool == "pipenv" {
+        return Err(unsupported(
+            operation,
+            Some("python"),
+            Some(tool),
+            UnsupportedReason::PipenvUnsupported,
+            "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+            Some("Use `--tool uv`, `--tool poetry`, `--tool pdm`, or `--tool pip`.".to_string()),
+        ));
+    }
+    if root_component(detection, Ecosystem::Python).is_none() {
+        return Err(unsupported(
+            operation,
+            Some("python"),
+            Some(tool),
+            UnsupportedReason::NoRootProject,
+            "no Python project was detected at the project root",
+            Some("Run PAX from the project root or select one with `--dir`.".to_string()),
+        ));
+    }
+    let evidence = python_project_evidence(&detection.root);
+    match operation {
+        Operation::Build => {
+            if evidence.build.is_empty() {
+                return Err(unsupported(
+                    operation,
+                    Some("python"),
+                    Some(tool),
+                    UnsupportedReason::MissingProjectConfiguration,
+                    "Python build is not justified: no build-system or Python build tool configuration was found",
+                    Some(
+                        "Declare [build-system] in pyproject.toml (uv/PDM) or [tool.poetry] (Poetry)."
+                            .to_string(),
+                    ),
+                ));
+            }
+            let program = match tool {
+                "uv" | "poetry" | "pdm" => tool,
+                "pip" => {
+                    return Err(unsupported(
+                        operation,
+                        Some("python"),
+                        Some(tool),
+                        UnsupportedReason::NoNativeMapping,
+                        "pip has no project build operation",
+                        Some(
+                            "Use `pax exec python -m build` with the 'build' package installed, or select `--tool uv`, `--tool poetry`, or `--tool pdm`."
+                                .to_string(),
+                        ),
+                    ));
+                }
+                _ => unreachable!(),
+            };
+            Ok(RunCommand {
+                program: program.to_string(),
+                args: std::iter::once("build".to_string())
+                    .chain(extra_args.iter().cloned())
+                    .collect(),
+                working_directory: detection.root.clone(),
+            })
+        }
+        Operation::Test | Operation::Lint | Operation::Typecheck => {
+            let (justification, configured, tool_args, config_hint) = match operation {
+                Operation::Test => (
+                    &evidence.test,
+                    "pytest",
+                    vec!["pytest"],
+                    "Declare pytest or configure [tool.pytest.ini_options], pytest.ini, tox.ini, or setup.cfg.",
+                ),
+                Operation::Lint => (
+                    &evidence.lint,
+                    "Ruff",
+                    vec!["ruff", "check"],
+                    "Declare ruff or configure [tool.ruff], ruff.toml, or .ruff.toml.",
+                ),
+                Operation::Typecheck => (
+                    &evidence.typecheck,
+                    "mypy",
+                    vec!["mypy"],
+                    "Declare mypy or configure [tool.mypy], mypy.ini, .mypy.ini, or setup.cfg.",
+                ),
+                _ => unreachable!(),
+            };
+            if justification.is_empty() {
+                return Err(unsupported(
+                    operation,
+                    Some("python"),
+                    Some(tool),
+                    UnsupportedReason::MissingProjectConfiguration,
+                    format!(
+                        "Python {} is not justified: {configured} is neither declared nor configured",
+                        operation.name()
+                    ),
+                    Some(config_hint.to_string()),
+                ));
+            }
+            let (program, mut args) = match tool {
+                "uv" | "poetry" | "pdm" => (
+                    tool.to_string(),
+                    std::iter::once("run".to_string()).collect::<Vec<_>>(),
+                ),
+                "pip" => (
+                    "python".to_string(),
+                    std::iter::once("-m".to_string()).collect::<Vec<_>>(),
+                ),
+                _ => unreachable!(),
+            };
+            args.extend(tool_args.into_iter().map(str::to_string));
+            args.extend(extra_args.iter().cloned());
+            Ok(RunCommand {
+                program,
+                args,
+                working_directory: detection.root.clone(),
+            })
+        }
+        _ => unreachable!("only standard project operations reach the Python matrix"),
+    }
+}
+
+fn python_project_evidence(path: &Path) -> PythonProjectEvidence {
+    let mut evidence = PythonProjectEvidence::default();
+    let mut package_declared = |package: &str| -> bool {
+        let name = normalize_python_name(package);
+        let mut declared = false;
+        if let Ok(contents) = fs::read_to_string(path.join("pyproject.toml"))
+            && let Ok(value) = toml::from_str::<toml::Value>(&contents)
+            && toml_declares_package(&value, &name)
+        {
+            declared = true;
+        }
+        if let Ok(contents) = fs::read_to_string(path.join("Pipfile"))
+            && let Ok(value) = toml::from_str::<toml::Value>(&contents)
+            && toml_declares_package(&value, &name)
+        {
+            declared = true;
+        }
+        for manifest in [
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements-dev.txt",
+        ] {
+            if declared {
+                break;
+            }
+            if let Ok(contents) = fs::read_to_string(path.join(manifest)) {
+                declared = contents.lines().any(|line| {
+                    requirement_name(line)
+                        .is_some_and(|candidate| normalize_python_name(candidate) == name)
+                });
+            }
+        }
+        if !declared
+            && let Ok(entries) = fs::read_dir(path)
+        {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                if (file_name.starts_with("requirements") && file_name.ends_with(".txt"))
+                    || (file_name.ends_with(".txt")
+                        && entry.path().parent().is_some_and(|parent| parent.ends_with("requirements")))
+                {
+                    if let Ok(contents) = fs::read_to_string(entry.path()) {
+                        declared = contents.lines().any(|line| {
+                            requirement_name(line).is_some_and(|candidate| {
+                                normalize_python_name(candidate) == name
+                            })
+                        });
+                    }
+                    if declared {
+                        break;
+                    }
+                }
+            }
+        }
+        declared
+    };
+
+    if let Ok(contents) = fs::read_to_string(path.join("pyproject.toml"))
+        && let Ok(value) = toml::from_str::<toml::Value>(&contents)
+    {
+        if value.get("build-system").is_some() {
+            evidence.build.push("pyproject.toml#[build-system]".to_string());
+        }
+        if value.get("tool").and_then(|tool| tool.get("poetry")).is_some() {
+            evidence.build.push("pyproject.toml#[tool.poetry]".to_string());
+        }
+        if value.get("tool").and_then(|tool| tool.get("pdm")).is_some() {
+            evidence.build.push("pyproject.toml#[tool.pdm]".to_string());
+        }
+        if value
+            .get("tool")
+            .and_then(|tool| tool.get("pytest"))
+            .and_then(|pytest| pytest.get("ini_options"))
+            .is_some()
+        {
+            evidence
+                .test
+                .push("pyproject.toml#[tool.pytest.ini_options]".to_string());
+        }
+        if value.get("tool").and_then(|tool| tool.get("ruff")).is_some() {
+            evidence.lint.push("pyproject.toml#[tool.ruff]".to_string());
+        }
+        if value.get("tool").and_then(|tool| tool.get("mypy")).is_some() {
+            evidence
+                .typecheck
+                .push("pyproject.toml#[tool.mypy]".to_string());
+        }
+    }
+    if package_declared("pytest") {
+        evidence.test.push("declared pytest dependency".to_string());
+    }
+    if package_declared("ruff") {
+        evidence.lint.push("declared Ruff dependency".to_string());
+    }
+    if package_declared("mypy") {
+        evidence
+            .typecheck
+            .push("declared mypy dependency".to_string());
+    }
+    if path.join("pytest.ini").is_file() {
+        evidence.test.push("pytest.ini".to_string());
+    }
+    if path.join("tox.ini").is_file()
+        && file_contains_section(&path.join("tox.ini"), "[pytest]")
+    {
+        evidence.test.push("tox.ini#[pytest]".to_string());
+    }
+    if path.join("setup.cfg").is_file()
+        && file_contains_section(&path.join("setup.cfg"), "[tool:pytest]")
+    {
+        evidence.test.push("setup.cfg#[tool:pytest]".to_string());
+    }
+    if path.join("ruff.toml").is_file() {
+        evidence.lint.push("ruff.toml".to_string());
+    }
+    if path.join(".ruff.toml").is_file() {
+        evidence.lint.push(".ruff.toml".to_string());
+    }
+    if path.join("mypy.ini").is_file() {
+        evidence.typecheck.push("mypy.ini".to_string());
+    }
+    if path.join(".mypy.ini").is_file() {
+        evidence.typecheck.push(".mypy.ini".to_string());
+    }
+    if path.join("setup.cfg").is_file()
+        && file_contains_section(&path.join("setup.cfg"), "[mypy]")
+    {
+        evidence
+            .typecheck
+            .push("setup.cfg#[mypy]".to_string());
+    }
+    evidence
+}
+
+fn requirement_name(line: &str) -> Option<String> {
+    let line = strip_requirement_comment(line).trim();
+    if line.is_empty() || line.starts_with('-') || line.contains("://") {
+        return None;
+    }
+    parse_requirement(line).map(|(name, _)| name)
+}
+
+fn toml_declares_package(value: &toml::Value, package: &str) -> bool {
+    match value {
+        toml::Value::String(value) => requirement_name(value)
+            .is_some_and(|candidate| normalize_python_name(&candidate) == package),
+        toml::Value::Array(values) => values
+            .iter()
+            .any(|value| toml_declares_package(value, package)),
+        toml::Value::Table(values) => values.iter().any(|(key, value)| {
+            normalize_python_name(key) == package || toml_declares_package(value, package)
+        }),
+        _ => false,
+    }
+}
+
+fn file_contains_section(path: &Path, section: &str) -> bool {
+    fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case(section))
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_standard_project_command(
     detection: &RepositoryDetection,
-    operation: &str,
+    operation: &Operation,
     extra_args: &[String],
     override_tool: Option<&str>,
-) -> Result<RunCommand, CliError> {
-    let selected_tool = override_tool.or_else(|| {
-        detection
-            .manager
-            .as_ref()
-            .map(|manager| manager.name.display_name())
-    });
-    if selected_tool.is_some_and(|tool| PackageManager::parse(tool).is_some()) {
+) -> Result<RunCommand, ResolveError> {
+    let operation_name = operation.name();
+    let tool = if let Some(tool) = override_tool {
+        tool.to_string()
+    } else if let Some(manager) = detection.manager.as_ref() {
+        manager.name.display_name().to_string()
+    } else if let Some(component) = root_component(detection, Ecosystem::Rust) {
+        component
+            .tool
+            .clone()
+            .unwrap_or_else(|| "cargo".to_string())
+    } else if let Some(component) = root_component(detection, Ecosystem::Python) {
+        component
+            .tool
+            .clone()
+            .unwrap_or_else(|| "pip".to_string())
+    } else if let Some(component) = root_component(detection, Ecosystem::Container) {
+        component
+            .tool
+            .clone()
+            .unwrap_or_else(|| "docker".to_string())
+    } else {
+        return Err(unsupported(
+            operation,
+            None,
+            None,
+            UnsupportedReason::NoAuthoritativeTool,
+            format!(
+                "project operation '{operation_name}' is not supported: no authoritative native tool was detected"
+            ),
+            Some("Use `--tool` to select a native tool.".to_string()),
+        ));
+    };
+
+    if PackageManager::parse(&tool).is_some() {
         if !detection
             .package_json_data
             .as_ref()
-            .is_some_and(|data| data.scripts.contains_key(operation))
+            .is_some_and(|data| data.scripts.contains_key(&operation_name))
         {
-            return Err(CliError {
-                message: format!(
-                    "project operation '{operation}' is not supported: package.json has no '{operation}' script\nUse `pax run <operation>` for another project-defined operation."
+            return Err(unsupported(
+                operation,
+                Some("javascript"),
+                Some(&tool),
+                UnsupportedReason::MissingProjectScript,
+                format!(
+                    "project operation '{operation_name}' is not supported: package.json has no '{operation_name}' script"
                 ),
-                exit_code: 2,
-            });
+                Some(format!(
+                    "Add an '{operation_name}' script or use `pax run <operation>` for another project-defined operation."
+                )),
+            ));
         }
-        let run_args = std::iter::once(operation.to_string())
+        let run_args = std::iter::once(operation_name)
             .chain(extra_args.iter().cloned())
             .collect::<Vec<_>>();
-        return build_run_command(detection, &run_args, override_tool);
+        return build_run_command(detection, &run_args, Some(&tool), operation);
     }
 
-    let root_component = detection
-        .components
-        .iter()
-        .find(|component| component.path == ".");
-    let tool = override_tool
-        .or_else(|| root_component.and_then(|component| component.tool.as_deref()))
-        .ok_or_else(|| CliError {
-            message: format!("project operation '{operation}' is not supported: no authoritative native tool was detected"),
-            exit_code: 1,
-        })?;
-    if tool == "cargo" {
-        let native_operation = match operation {
-            "build" => "build",
-            "test" => "test",
-            "lint" => "clippy",
-            "typecheck" => "check",
-            _ => unreachable!(),
-        };
-        return Ok(RunCommand {
-            program: "cargo".to_string(),
-            args: std::iter::once(native_operation.to_string())
-                .chain(extra_args.iter().cloned())
-                .collect(),
-            working_directory: detection.root.clone(),
-        });
+    match tool.as_str() {
+        "cargo" => {
+            let native_operation = match operation {
+                Operation::Build => "build",
+                Operation::Test => "test",
+                Operation::Lint => "clippy",
+                Operation::Typecheck => "check",
+                _ => unreachable!(),
+            };
+            Ok(RunCommand {
+                program: "cargo".to_string(),
+                args: std::iter::once(native_operation.to_string())
+                    .chain(extra_args.iter().cloned())
+                    .collect(),
+                working_directory: detection.root.clone(),
+            })
+        }
+        "docker" => resolve_docker_operation(detection, operation, extra_args),
+        "uv" | "poetry" | "pdm" | "pip" | "pipenv" => {
+            resolve_python_operation(detection, operation, extra_args, &tool)
+        }
+        _ => Err(unsupported(
+            operation,
+            None,
+            Some(&tool),
+            UnsupportedReason::UnsupportedTool,
+            format!("unsupported execution tool: {tool}"),
+            Some("Use `--tool` to select a supported native tool.".to_string()),
+        )),
     }
-    if tool == "docker" && operation == "build" {
-        return Ok(RunCommand {
-            program: "docker".to_string(),
-            args: std::iter::once("compose".to_string())
-                .chain(std::iter::once("build".to_string()))
-                .chain(extra_args.iter().cloned())
-                .collect(),
-            working_directory: detection.root.clone(),
-        });
-    }
-    let run_args = std::iter::once(operation.to_string())
-        .chain(extra_args.iter().cloned())
-        .collect::<Vec<_>>();
-    build_run_command(detection, &run_args, override_tool)
 }
 
 fn resolve_root_install_command(
     detection: &RepositoryDetection,
     override_tool: Option<&str>,
-) -> Result<RunCommand, CliError> {
-    if detection.package_json
-        || override_tool.is_some_and(|tool| PackageManager::parse(tool).is_some())
-    {
-        return build_install_command(detection, &[], override_tool);
+    operation: &Operation,
+) -> Result<RunCommand, ResolveError> {
+    if override_tool.is_some_and(|tool| PackageManager::parse(tool).is_some()) {
+        return build_install_command(detection, &[], override_tool, operation);
+    }
+    if detection.package_json {
+        let Some(manager) = detection.manager.as_ref() else {
+            return Err(unsupported(
+                operation,
+                Some("javascript"),
+                None,
+                UnsupportedReason::NoAuthoritativeTool,
+                "package.json is present but no authoritative JavaScript package manager was detected",
+                Some("Use `--tool npm`, `--tool pnpm`, `--tool yarn`, or `--tool bun`.".to_string()),
+            ));
+        };
+        return Ok(RunCommand {
+            program: manager.name.display_name().to_string(),
+            args: vec!["install".to_string()],
+            working_directory: detection.root.clone(),
+        });
     }
     let component = detection
         .components
         .iter()
         .find(|component| component.path == ".")
-        .ok_or_else(|| CliError {
-            message: "no installable root project detected".to_string(),
-            exit_code: 1,
+        .ok_or_else(|| {
+            unsupported(
+                operation,
+                None,
+                override_tool,
+                UnsupportedReason::NoRootProject,
+                "no installable root project detected",
+                Some("Run PAX from a project root or select one with `--dir`.".to_string()),
+            )
         })?;
     let tool = override_tool
-        .or(component.tool.as_deref())
-        .ok_or_else(|| CliError {
-            message: "could not detect an authoritative package manager".to_string(),
-            exit_code: 1,
+        .map(str::to_string)
+        .or_else(|| component.tool.clone())
+        .ok_or_else(|| {
+            unsupported(
+                operation,
+                ecosystem_name(component.ecosystem),
+                None,
+                UnsupportedReason::NoAuthoritativeTool,
+                "could not detect an authoritative package manager",
+                Some("Use `--tool` to select a native package manager.".to_string()),
+            )
         })?;
-    let (program, args) = match tool {
+    let (program, args) = match tool.as_str() {
         "pipenv" => {
-            return Err(CliError {
-                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                exit_code: 2,
-            });
+            return Err(unsupported(
+                operation,
+                Some("python"),
+                Some(&tool),
+                UnsupportedReason::PipenvUnsupported,
+                "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                Some("Use `pax run <target>` or an explicit `pax exec` command.".to_string()),
+            ));
         }
         "uv" => ("uv", vec!["sync".to_string()]),
-        "poetry" | "pdm" => (tool, vec!["install".to_string()]),
+        "poetry" | "pdm" => (tool.as_str(), vec!["install".to_string()]),
         "pip" => {
             let requirements = component
                 .manifests
@@ -3578,11 +4484,29 @@ fn resolve_root_install_command(
             }
         }
         "cargo" => ("cargo", vec!["fetch".to_string()]),
+        "docker" => {
+            if has_compose_file(component) {
+                ("docker", vec!["compose".to_string(), "pull".to_string()])
+            } else {
+                return Err(unsupported(
+                    operation,
+                    Some("docker"),
+                    Some(&tool),
+                    UnsupportedReason::NoNativeMapping,
+                    "Dockerfile-only projects have no dependency-install operation",
+                    Some("Use `pax exec docker build ...` or add a Compose file.".to_string()),
+                ));
+            }
+        }
         _ => {
-            return Err(CliError {
-                message: format!("unsupported install operation for {tool}"),
-                exit_code: 2,
-            });
+            return Err(unsupported(
+                operation,
+                ecosystem_name(component.ecosystem),
+                Some(&tool),
+                UnsupportedReason::UnsupportedTool,
+                format!("unsupported install operation for {tool}"),
+                Some("Use `--tool` to select a supported package manager.".to_string()),
+            ));
         }
     };
     Ok(RunCommand {
@@ -3597,6 +4521,7 @@ fn dispatch_resolved_operation(
     detection: &RepositoryDetection,
     dry_run: bool,
     json: bool,
+    timeout: Option<Duration>,
 ) -> Result<String, CliError> {
     if dry_run {
         let is_deploy = matches!(resolved.operation, Operation::Deploy);
@@ -3611,6 +4536,7 @@ fn dispatch_resolved_operation(
         if !resolved.evidence.is_empty() {
             plan.evidence = resolved.evidence;
         }
+        let tool = plan.tool.clone().unwrap_or_else(|| "none".to_string());
         return if json {
             serde_json::to_string_pretty(&plan).map_err(|error| CliError {
                 message: format!("failed to serialize execution plan: {error}"),
@@ -3621,7 +4547,7 @@ fn dispatch_resolved_operation(
                 Ok(format!(
                     "ecosystem: {}\nprovider: {}\nevidence: {}\ncommand: {}\nworking directory: {}",
                     plan.ecosystem,
-                    plan.tool,
+                    tool,
                     if plan.evidence.is_empty() {
                         "none".to_string()
                     } else {
@@ -3634,7 +4560,7 @@ fn dispatch_resolved_operation(
                 Ok(format!(
                     "Operation:   {}\nTool:        {}\nSelected by: {}\nCommand:     {}\nWorking dir: {}",
                     plan.operation,
-                    plan.tool,
+                    tool,
                     plan.selection_reason,
                     plan.command.join(" "),
                     plan.working_directory
@@ -3642,12 +4568,18 @@ fn dispatch_resolved_operation(
             }
         };
     }
-    dispatch_execution(resolved.command, false, json)
+    dispatch_execution(resolved.command, false, json, timeout)
 }
 
-fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<String, CliError> {
+fn dispatch_execution(
+    command: RunCommand,
+    dry_run: bool,
+    json: bool,
+    timeout: Option<Duration>,
+) -> Result<String, CliError> {
     if dry_run {
         let plan = execution_plan(&command);
+        let tool = plan.tool.clone().unwrap_or_else(|| "none".to_string());
         return if json {
             serde_json::to_string_pretty(&plan).map_err(|error| CliError {
                 message: format!("failed to serialize execution plan: {error}"),
@@ -3657,7 +4589,7 @@ fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<
             Ok(format!(
                 "Ecosystem:   {}\nTool:        {}\nOperation:   {}\nEvidence:    {}\nCommand:     {}\nWorking dir: {}",
                 plan.ecosystem,
-                plan.tool,
+                tool,
                 plan.operation,
                 if plan.evidence.is_empty() {
                     "none".to_string()
@@ -3669,25 +4601,196 @@ fn dispatch_execution(command: RunCommand, dry_run: bool, json: bool) -> Result<
             ))
         };
     }
-    let status = Command::new(&command.program)
-        .args(&command.args)
-        .current_dir(&command.working_directory)
-        .status()
-        .map_err(|error| CliError {
-            message: format!("failed to execute {}: {error}", command.program),
-            exit_code: 1,
-        })?;
-    match status.code() {
-        Some(0) => Ok(String::new()),
-        Some(code) => Err(CliError {
+    match run_process_inherited(&command, timeout) {
+        Ok(ProcessOutcome::Exited(Some(0))) => Ok(String::new()),
+        Ok(ProcessOutcome::Exited(Some(code))) => Err(CliError {
             message: String::new(),
-            exit_code: code.min(u8::MAX as i32) as u8,
+            exit_code: code.clamp(0, u8::MAX as i32) as u8,
         }),
-        None => Err(CliError {
+        Ok(ProcessOutcome::Exited(None)) => Err(CliError {
             message: String::new(),
+            exit_code: 1,
+        }),
+        Ok(ProcessOutcome::TimedOut) => Err(CliError {
+            message: format!(
+                "execution timed out after {}: {}",
+                format_duration(timeout.unwrap_or_default()),
+                render_command(&command)
+            ),
+            exit_code: 124,
+        }),
+        Err(error) => Err(CliError {
+            message: format!("failed to execute {}: {error}", command.program),
             exit_code: 1,
         }),
     }
+}
+
+fn dispatch_unsupported_plan(
+    detection: &RepositoryDetection,
+    operation: &Operation,
+    error: ResolveError,
+    json: bool,
+) -> Result<String, CliError> {
+    let unsupported = error.into_unsupported(operation);
+    let plan = ExecutionPlan {
+        schema: contract::PLAN_SCHEMA,
+        operation: unsupported.operation.clone(),
+        ecosystem: unsupported
+            .ecosystem
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        tool: unsupported.tool.clone(),
+        runner: String::new(),
+        command: Vec::new(),
+        evidence: Vec::new(),
+        working_directory: detection.root.display().to_string(),
+        project_root: detection.root.display().to_string(),
+        workspace: detection.workspace_source.clone(),
+        environment: BTreeMap::new(),
+        supported: false,
+        unsupported: Some(unsupported.clone()),
+        selection_reason: unsupported.message.clone(),
+    };
+    if json {
+        let document = serde_json::to_string_pretty(&plan).map_err(|error| CliError {
+            message: format!("failed to serialize execution plan: {error}"),
+            exit_code: 1,
+        })?;
+        println!("{document}");
+        Err(CliError {
+            message: String::new(),
+            exit_code: 2,
+        })
+    } else {
+        Err(CliError {
+            message: unsupported.render(),
+            exit_code: 2,
+        })
+    }
+}
+
+fn render_command(command: &RunCommand) -> String {
+    std::iter::once(command.program.clone())
+        .chain(command.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 && duration.as_secs() > 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessOutcome {
+    Exited(Option<i32>),
+    TimedOut,
+}
+
+fn run_process_inherited(
+    command: &RunCommand,
+    timeout: Option<Duration>,
+) -> Result<ProcessOutcome, std::io::Error> {
+    let mut child = Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(&command.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(ProcessOutcome::Exited(status.code())),
+            None => {}
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(ProcessOutcome::TimedOut);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn run_process_captured(
+    command: &RunCommand,
+    args: &[String],
+    timeout: Option<Duration>,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> Result<ProcessOutcome, std::io::Error> {
+    let mut child = Command::new(&command.program)
+        .args(args)
+        .current_dir(&command.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (sender, receiver) = mpsc::channel::<String>();
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buffer)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut timed_out = false;
+    let status = loop {
+        while let Ok(line) = receiver.try_recv() {
+            if !on_line(&line) {
+                eprintln!("{line}");
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error);
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    if !timed_out {
+        let _ = reader.join();
+        while let Ok(line) = receiver.try_recv() {
+            if !on_line(&line) {
+                eprintln!("{line}");
+            }
+        }
+        return Ok(ProcessOutcome::Exited(
+            status.and_then(|status| status.code()),
+        ));
+    }
+    // Do not join the reader after a timeout: a descendant may still hold the
+    // pipe open. The child itself has been killed and reaped.
+    Ok(ProcessOutcome::TimedOut)
 }
 
 fn execution_plan(command: &RunCommand) -> ExecutionPlan {
@@ -3765,7 +4868,7 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
             "javascript"
         }
         .to_string(),
-        tool: tool.to_string(),
+        tool: Some(tool.to_string()),
         runner: if command.program == "pnpm"
             && command.args.first().map(String::as_str) == Some("dlx")
         {
@@ -3782,6 +4885,7 @@ fn execution_plan(command: &RunCommand) -> ExecutionPlan {
         workspace: None,
         environment: BTreeMap::new(),
         supported: true,
+        unsupported: None,
         selection_reason: format!("selected {tool} from project evidence"),
     }
 }
@@ -3790,10 +4894,17 @@ fn build_run_command(
     detection: &RepositoryDetection,
     run_args: &[String],
     override_tool: Option<&str>,
-) -> Result<RunCommand, CliError> {
-    let target = run_args.first().ok_or_else(|| CliError {
-        message: format!("pax run requires a target\n\n{}", usage()),
-        exit_code: 2,
+    operation: &Operation,
+) -> Result<RunCommand, ResolveError> {
+    let target = run_args.first().ok_or_else(|| {
+        unsupported(
+            operation,
+            None,
+            override_tool,
+            UnsupportedReason::MissingTarget,
+            "pax run requires a target",
+            Some(usage()),
+        )
     })?;
     let extra_args = &run_args[1..];
 
@@ -3807,56 +4918,60 @@ fn build_run_command(
                 working_directory: detection.root.clone(),
             });
         }
-        let mut args = Vec::new();
-        let program = match tool {
-            "pipenv" => {
-                return Err(CliError {
-                    message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                    exit_code: 2,
-                });
-            }
+        return match tool {
+            "pipenv" => Err(unsupported(
+                operation,
+                Some("python"),
+                Some(tool),
+                UnsupportedReason::PipenvUnsupported,
+                "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                Some("Use `--tool uv`, `--tool poetry`, `--tool pdm`, or `--tool pip`.".to_string()),
+            )),
             "uv" | "poetry" | "pdm" => {
-                args.push("run".to_string());
-                tool
+                let mut args = vec!["run".to_string(), target.clone()];
+                args.extend(extra_args.iter().cloned());
+                Ok(RunCommand {
+                    program: tool.to_string(),
+                    args,
+                    working_directory: detection.root.clone(),
+                })
+            }
+            "pip" => {
+                let mut args = vec![target.clone()];
+                args.extend(extra_args.iter().cloned());
+                Ok(RunCommand {
+                    program: "python".to_string(),
+                    args,
+                    working_directory: detection.root.clone(),
+                })
             }
             "cargo" => {
-                args.extend([
+                let mut args = vec![
                     "run".to_string(),
                     "--bin".to_string(),
                     target.clone(),
                     "--".to_string(),
-                ]);
-                "cargo"
+                ];
+                args.extend(extra_args.iter().cloned());
+                Ok(RunCommand {
+                    program: "cargo".to_string(),
+                    args,
+                    working_directory: detection.root.clone(),
+                })
             }
-            "docker" => {
-                args.extend([
-                    "compose".to_string(),
-                    "run".to_string(),
-                    "--rm".to_string(),
-                    target.clone(),
-                ]);
-                "docker"
-            }
-            _ => {
-                return Err(CliError {
-                    message: format!("unsupported execution tool: {tool}"),
-                    exit_code: 2,
-                });
-            }
+            "docker" => resolve_docker_run(detection, target, extra_args, operation),
+            _ => Err(unsupported(
+                operation,
+                None,
+                Some(tool),
+                UnsupportedReason::UnsupportedTool,
+                format!("unsupported execution tool: {tool}"),
+                Some("Use `--tool` to select a supported native tool.".to_string()),
+            )),
         };
-        if !matches!(tool, "cargo" | "docker") {
-            args.push(target.clone());
-        }
-        args.extend(extra_args.iter().cloned());
-        return Ok(RunCommand {
-            program: program.to_string(),
-            args,
-            working_directory: detection.root.clone(),
-        });
     }
 
-    let manager = detection.manager.clone();
-    if let Some(manager) = manager.as_ref() {
+    if let Some(manager) = detection.manager.as_ref() {
         let mut args = vec!["run".to_string(), target.clone()];
         args.extend(extra_args.iter().cloned());
         return Ok(RunCommand {
@@ -3866,77 +4981,71 @@ fn build_run_command(
         });
     }
 
-    let component = detection
-        .components
-        .iter()
-        .filter(|component| component.path == ".")
-        .find(|component| matches!(component.ecosystem, Ecosystem::Python))
-        .or_else(|| {
-            detection
-                .components
-                .iter()
-                .filter(|component| component.path == ".")
-                .find(|component| matches!(component.ecosystem, Ecosystem::Rust))
-        })
-        .or_else(|| {
-            detection
-                .components
-                .iter()
-                .filter(|component| component.path == ".")
-                .find(|component| matches!(component.ecosystem, Ecosystem::Container))
-        })
-        .ok_or_else(|| CliError {
-            message: "could not detect an authoritative execution tool".to_string(),
-            exit_code: 1,
-        })?;
-    let working_directory = if component.path == "." {
-        detection.root.clone()
-    } else {
-        detection.root.join(&component.path)
-    };
-    let mut args = Vec::new();
-    let program = match (component.ecosystem, component.tool.as_deref()) {
-        (Ecosystem::Python, Some("uv" | "poetry" | "pdm")) => {
-            args.push("run".to_string());
-            component.tool.clone().unwrap()
-        }
-        (Ecosystem::Python, Some("pip")) => "python".to_string(),
-        (Ecosystem::Python, Some("pipenv")) => {
-            return Err(CliError {
-                message: "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands".to_string(),
-                exit_code: 2,
-            });
-        }
-        (Ecosystem::Rust, Some("cargo")) => {
-            args.extend(["run".to_string(), "--bin".to_string(), target.clone()]);
-            args.extend(["--".to_string()]);
-            "cargo".to_string()
-        }
-        (Ecosystem::Container, Some("docker")) => {
-            args.push("compose".to_string());
-            if matches!(target.as_str(), "up" | "down" | "logs" | "ps") {
-                args.push(target.clone());
-            } else {
-                args.extend(["run".to_string(), "--rm".to_string(), target.clone()]);
+    if let Some(component) = root_component(detection, Ecosystem::Python) {
+        return match component.tool.as_deref() {
+            Some("uv" | "poetry" | "pdm") => {
+                let mut args = vec!["run".to_string(), target.clone()];
+                args.extend(extra_args.iter().cloned());
+                Ok(RunCommand {
+                    program: component.tool.clone().unwrap(),
+                    args,
+                    working_directory: detection.root.clone(),
+                })
             }
-            "docker".to_string()
-        }
-        _ => {
-            return Err(CliError {
-                message: "could not detect an authoritative execution tool".to_string(),
-                exit_code: 1,
+            Some("pip") => {
+                let mut args = vec![target.clone()];
+                args.extend(extra_args.iter().cloned());
+                Ok(RunCommand {
+                    program: "python".to_string(),
+                    args,
+                    working_directory: detection.root.clone(),
+                })
+            }
+            Some("pipenv") => Err(unsupported(
+                operation,
+                Some("python"),
+                Some("pipenv"),
+                UnsupportedReason::PipenvUnsupported,
+                "pipenv is not supported: PAX can discover Pipfile declarations but cannot run pipenv commands",
+                Some("Use `--tool uv`, `--tool poetry`, `--tool pdm`, or `--tool pip`.".to_string()),
+            )),
+            _ => Err(unsupported(
+                operation,
+                Some("python"),
+                component.tool.as_deref(),
+                UnsupportedReason::NoAuthoritativeTool,
+                "could not detect an authoritative Python execution tool",
+                Some("Use `--tool` to select a Python tool.".to_string()),
+            )),
+        };
+    }
+    if let Some(component) = root_component(detection, Ecosystem::Rust) {
+        if component.tool.as_deref() == Some("cargo") {
+            let mut args = vec![
+                "run".to_string(),
+                "--bin".to_string(),
+                target.clone(),
+                "--".to_string(),
+            ];
+            args.extend(extra_args.iter().cloned());
+            return Ok(RunCommand {
+                program: "cargo".to_string(),
+                args,
+                working_directory: detection.root.clone(),
             });
         }
-    };
-    if !matches!(component.ecosystem, Ecosystem::Rust | Ecosystem::Container) {
-        args.push(target.clone());
     }
-    args.extend(extra_args.iter().cloned());
-    Ok(RunCommand {
-        program,
-        args,
-        working_directory,
-    })
+    if root_component(detection, Ecosystem::Container).is_some() {
+        return resolve_docker_run(detection, target, extra_args, operation);
+    }
+    Err(unsupported(
+        operation,
+        None,
+        None,
+        UnsupportedReason::NoAuthoritativeTool,
+        "could not detect an authoritative execution tool",
+        Some("Use `--tool` to select a native tool.".to_string()),
+    ))
 }
 
 fn detect_repository(root: &Path) -> Result<RepositoryDetection, CliError> {
