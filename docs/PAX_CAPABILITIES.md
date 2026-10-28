@@ -65,6 +65,28 @@ Docker/Compose runtime observation rather than naming a command it never ran.
 Priorities: **P0** = output is misleading today; **P1** = needed for an honest
 contract; **P2** = useful with a concrete consumer; **P3** = defer.
 
+## Execution semantics
+
+PAX delegates execution operations to native tools. When no valid mapping exists, PAX returns a typed `unsupported` result with a specific reason code.
+
+| Operation | Rust (Cargo) | JavaScript | Python | Docker/Compose |
+|-----------|--------------|------------|--------|----------------|
+| `build` | `cargo build` | package-manager `build` script | `uv build` / `poetry build` / `pdm build` (requires [build-system]) | `docker compose build` or `docker build` |
+| `test` | `cargo test` (interpretation via `--message-format=json`) | package-manager `test` script | `uv run pytest` / `poetry run pytest` (requires pytest config) | ❌ unsupported: use `pax run <service>` instead |
+| `lint` | `cargo clippy` | package-manager `lint` script | `uv run ruff check` / `poetry run ruff check` (requires ruff config) | ❌ unsupported: use `pax exec docker compose ...` instead |
+| `typecheck` | `cargo check` | package-manager `typecheck` script | `uv run mypy` / `poetry run mypy` (requires mypy config) | ❌ unsupported: use `pax exec docker compose ...` instead |
+| `install` | `cargo fetch` | `npm install` / `pnpm install` / `yarn install` / `bun install` | `uv sync` / `poetry install` / `pdm install` / `pip install -r requirements.txt` | `docker compose pull` (Compose only) |
+| `add` | `cargo add` | `npm add` / `pnpm add` / `yarn add` / `bun add` | `uv add` / `poetry add` / `pdm add` | ❌ unsupported: use `pax exec docker ...` instead |
+| `remove` | `cargo remove` | `npm remove` / `pnpm remove` / `yarn remove` / `bun remove` | `uv remove` / `poetry remove` / `pdm remove` | ❌ unsupported: use `pax exec docker ...` instead |
+| `run` | `cargo run` | `npm run <script>` | `uv run <cmd>` / `poetry run <cmd>` | `docker compose run <service>` or `docker compose <operation>` |
+| `x` | `cargo <tool>` | `npm exec` / `pnpm exec` / `yarn dlx` / `bunx` | `uvx` / `pipx` | ❌ unsupported: use `pax exec docker ...` instead |
+
+**Notes:**
+- **JavaScript**: PAX uses the package-manager specified in `packageManager` field or lockfile precedence (`npm` > `pnpm` > `yarn` > `bun`). Scripts must exist in `package.json` for `build`, `test`, `lint`, `typecheck`.
+- **Python**: Operations require both tool availability and project configuration (e.g., pytest in pyproject.toml for `test`). Pipenv is discovered but unsupported for execution.
+- **Docker**: Only `build` and `install` (pull) have native mappings. `run` accepts Compose operations or service names.
+- **Unsupported result**: When no mapping exists, PAX returns `outcome: unsupported` with `reason` in `executionResult` (see PAX_CONTRACT.md).
+
 ## Commands
 
 | Command | Class | Reads | Starts a process | Writes |
