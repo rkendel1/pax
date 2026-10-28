@@ -199,7 +199,8 @@ PAX diagnostics go to stderr. Example:
 | `reason` | always | stable machine code refining `status` (below) |
 | `tool` | always | selected native tool, or `null` if none was selected |
 | `exit_code` | always | the native process exit status, unmodified (`101` stays `101`); `null` if no native process ran to a normal exit |
-| `tests` | optional | `passed`, `failed`, `ignored`, `measured` summed over every libtest summary; present only when every summary line parsed |
+| `tests` | optional | `passed`, `failed`, `ignored`, `measured` summed over every libtest summary; present only when every summary line parsed. For a JavaScript runner (below), `ignored` is skipped + pending + todo and `measured` is `0`. |
+| `runner` | optional | `vitest`, `jest` or `node-test`: the JavaScript runner whose result PAX read from the project's `test` script. Absent for Cargo and for anything PAX has no semantics for. |
 
 The semantic fields contain no timestamps, process ids, or paths. Process exit
 status of `pax` itself mirrors the native status when a process ran, and PAX's
@@ -214,7 +215,10 @@ error).
 | `failed` | `native-exit-nonzero` / `terminated-by-signal` | Cargo ran and exited non-zero (or was killed) without more specific evidence. |
 | `not_run` | `no-tests-executed` | Cargo exited 0 and libtest reports zero passed and zero measured tests (zero tests, or only ignored tests). |
 | `unsupported` | `no-libtest-evidence` | Cargo exited 0 but PAX cannot establish that tests executed (`--no-run`, `-- --list`, `harness = false` targets, unparseable summaries). Exit 0 alone is not treated as a pass. |
-| `unsupported` | `interpretation-unsupported` | The selected tool (npm/pnpm/yarn/bun scripts, Python, Docker) is run and its `exit_code` preserved, but PAX has no authoritative test semantics for it. Do not treat `exit_code` as semantic. |
+| `passed` | `tests-passed` | (JavaScript) the runner exited 0, its report parsed strictly, no test or suite failed, and at least one test passed. |
+| `failed` | `tests-failed` / `test-suite-failed` | (JavaScript) the report counts failed tests, or a suite failed to load or run (which holds no tests), or the runner's own `success` is false. Checked before the exit status, so exit 0 does not rescue it. |
+| `unsupported` | `no-runner-evidence` | (JavaScript) the runner exited 0 but no report was produced, or it could not be parsed strictly, or its counts did not add up. Exit 0 alone is not a pass. |
+| `unsupported` | `interpretation-unsupported` | The selected tool (npm/pnpm/yarn/bun scripts whose runner PAX cannot read, Python, Docker) is run and its `exit_code` preserved, but PAX has no authoritative test semantics for it. Do not treat `exit_code` as semantic. |
 | `unsupported` | `operation-unsupported` | PAX's existing selection refuses the operation (for example no `test` script). Nothing is executed. |
 | `ambiguous` | `ambiguous-selection` | PAX's existing selection is ambiguous (multiple lockfiles). Nothing is executed and no fallback tool is chosen. |
 | `error` | `launch-failed` | The native tool could not be launched. Never reported as `failed`. |
@@ -226,6 +230,31 @@ For Cargo, PAX runs `cargo test --message-format=json-render-diagnostics`
 so counts come from its stable `test result:` summary lines; they are optional
 and omitted rather than guessed. Doctests, multiple test targets, and workspaces
 are covered because every summary is summed.
+
+### JavaScript runners
+
+For `npm`/`pnpm`/`yarn`/`bun` projects PAX runs the `test` script (`<manager> run test`) and, when it can
+tell which runner that is, adds the options that make the runner write a machine-readable report:
+
+| Runner | Options PAX adds | Read from |
+| --- | --- | --- |
+| Vitest | `--reporter=json --outputFile=FILE` | the Jest-compatible JSON document in FILE |
+| Jest | `--json --outputFile=FILE` | the same document |
+| `node --test` | `--test-reporter=tap` | the closing `# tests/pass/fail/cancelled/skipped/todo` lines on stdout |
+
+PAX reads the script text, so it only vouches for a script whose **last command** is the runner, which
+names exactly one runner, and which does not already choose a reporter or output file (`--reporter`,
+`--json`, `--outputFile`, `--test-reporter`). `vitest run`, `npx vitest run`, `pnpm exec vitest run`,
+`CI=1 jest --ci`, `tsc && vitest run` and `node --test` qualify; `vitest run && eslint .`, `jest && vitest`,
+`mocha` and `vitest run --reporter=verbose` do not, and stay `interpretation-unsupported`. A report must
+parse strictly (every count present, the test counts adding up); otherwise there is no evidence. The report
+file is a temporary file PAX deletes. Arguments reach the script as the manager passes them (`npm` gets a
+`--` first).
+
+Tested against a real `node --test` project through npm, and, because Vitest and Jest are not installed in
+PAX's test environment, against stand-in runners that write the document those runners' JSON reporters
+write. The pnpm and bun argument forwarding was not exercised here (pnpm was not runnable in the test
+environment).
 
 Zero tests: a project in which no test executes reports `not_run` with
 `exit_code: 0`, never `passed`.

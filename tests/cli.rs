@@ -1258,3 +1258,168 @@ fn graph_attributes_cargo_dependencies_to_the_declaring_package_only() {
         ]
     );
 }
+
+// ---- JavaScript test results (package.json `test` scripts) ----------------------------------------
+//
+// `node --test` is a real runner and these run it for real through npm. Vitest and Jest are not
+// installed here, so their cases use a stand-in executable in node_modules/.bin that writes the
+// document those runners write to the --outputFile PAX passes. That checks PAX's contract with the
+// document format (taken from the runners' JSON reporters), not any particular Vitest or Jest version.
+
+fn npm_available() -> bool {
+    std::process::Command::new("npm")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn js_project(script: &str) -> PathBuf {
+    let root = temp_dir();
+    write(
+        &root.join("package.json"),
+        &format!(
+            r#"{{"name":"t","version":"1.0.0","packageManager":"npm@10.9.0","scripts":{{"test":{script:?}}}}}"#
+        ),
+    );
+    write(&root.join("package-lock.json"), "{}");
+    root
+}
+
+#[cfg(unix)]
+fn stand_in_runner(root: &Path, name: &str, document: &str, exit: i32) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(name);
+    // Finds --outputFile=PATH among its arguments and writes the document there.
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --outputFile=*) out=\"${{a#--outputFile=}}\";; esac; done\nprintf '%s' '{document}' > \"$out\"\nexit {exit}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const PASSING_JSON: &str = r#"{"numTotalTestSuites":1,"numPassedTestSuites":1,"numFailedTestSuites":0,"numPendingTestSuites":0,"numTotalTests":3,"numPassedTests":2,"numFailedTests":0,"numPendingTests":1,"numTodoTests":0,"startTime":1,"success":true,"testResults":[]}"#;
+
+#[test]
+fn node_test_results_are_read_from_the_runner_for_a_passing_project() {
+    if !npm_available() {
+        return;
+    }
+    let root = js_project("node --test");
+    write(
+        &root.join("test/a.test.js"),
+        "const test=require('node:test');const assert=require('node:assert');test('a',()=>{assert.equal(1,1)});test('b',()=>{});test('s',{skip:true},()=>{});",
+    );
+    let output = pax_in(&root, &["--json", "test"]);
+    let value = result_json(&output);
+    assert_eq!(value["status"], "passed", "{value}");
+    assert_eq!(value["reason"], "tests-passed");
+    assert_eq!(value["runner"], "node-test");
+    assert_eq!(value["tests"]["passed"], 2);
+    assert_eq!(value["tests"]["ignored"], 1);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn node_test_failures_are_failed_with_counts_and_the_native_exit_code() {
+    if !npm_available() {
+        return;
+    }
+    let root = js_project("node --test");
+    write(
+        &root.join("test/a.test.js"),
+        "const test=require('node:test');const assert=require('node:assert');test('a',()=>{assert.equal(1,1)});test('bad',()=>{assert.equal(1,2)});",
+    );
+    let output = pax_in(&root, &["--json", "test"]);
+    let value = result_json(&output);
+    assert_eq!(value["status"], "failed", "{value}");
+    assert_eq!(value["reason"], "tests-failed");
+    assert_eq!(value["tests"]["failed"], 1);
+    assert_eq!(value["tests"]["passed"], 1);
+    assert_ne!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_project_with_no_tests_is_not_run_not_passed() {
+    if !npm_available() {
+        return;
+    }
+    let root = js_project("node --test");
+    write(&root.join("src/index.js"), "module.exports = 1;");
+    let output = pax_in(&root, &["--json", "test"]);
+    let value = result_json(&output);
+    assert_ne!(value["status"], "passed", "{value}");
+    assert_ne!(value["reason"], "tests-passed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_vitest_style_document_gives_a_result_and_a_missing_one_gives_none() {
+    if !npm_available() {
+        return;
+    }
+    // The document is read.
+    let root = js_project("vitest run");
+    stand_in_runner(&root, "vitest", PASSING_JSON, 0);
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "passed", "{value}");
+    assert_eq!(value["runner"], "vitest");
+    assert_eq!(
+        (
+            value["tests"]["passed"].as_u64(),
+            value["tests"]["ignored"].as_u64()
+        ),
+        (Some(2), Some(1))
+    );
+
+    // Exit 0 and no document: nothing is established.
+    let root = js_project("vitest run");
+    stand_in_runner(&root, "vitest", "", 0);
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "unsupported", "{value}");
+    assert_eq!(value["reason"], "no-runner-evidence");
+
+    // A suite that failed to load holds no tests, and is still a failure.
+    let root = js_project("jest --ci");
+    let broken = PASSING_JSON
+        .replace("\"numFailedTestSuites\":0", "\"numFailedTestSuites\":1")
+        .replace("\"success\":true", "\"success\":false");
+    stand_in_runner(&root, "jest", &broken, 1);
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "failed", "{value}");
+    assert_eq!(value["runner"], "jest");
+
+    // Exit 0 with a document that says something failed is not a pass.
+    let root = js_project("jest");
+    let lying = PASSING_JSON
+        .replace("\"numFailedTests\":0", "\"numFailedTests\":1")
+        .replace("\"numTotalTests\":3", "\"numTotalTests\":4");
+    stand_in_runner(&root, "jest", &lying, 0);
+    let value = result_json(&pax_in(&root, &["--json", "test"]));
+    assert_eq!(value["status"], "failed", "{value}");
+    assert_eq!(value["reason"], "tests-failed");
+}
+
+#[test]
+fn a_script_pax_cannot_read_a_runner_from_is_still_uninterpreted() {
+    if !npm_available() {
+        return;
+    }
+    for script in [
+        "vitest run && eslint .",
+        "mocha",
+        "vitest run --reporter=verbose",
+    ] {
+        let root = js_project(&format!("{script} || exit 0"));
+        let value = result_json(&pax_in(&root, &["--json", "test"]));
+        assert_ne!(value["status"], "passed", "{script}: {value}");
+        assert!(
+            value.get("runner").is_none() || value["runner"].is_null(),
+            "{script}: {value}"
+        );
+    }
+}
