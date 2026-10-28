@@ -5,8 +5,8 @@
 //! about the delegated operation. It never evaluates a consumer's wider goal.
 
 use super::{
-    CliError, CommandName, Operation, ParsedCli, RunCommand, detect_repository, execution_plan,
-    resolve_operation, resolve_working_directory, selection_ambiguity,
+    CliError, CommandName, Operation, PackageManager, ParsedCli, RunCommand, detect_repository,
+    execution_plan, resolve_operation, resolve_working_directory, selection_ambiguity,
 };
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
@@ -46,6 +46,11 @@ pub(crate) struct ExecutionResult {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests: Option<TestCounts>,
+    /// The test runner PAX read the result of, when it read one from a script:
+    /// `vitest`, `jest` or `node-test`. Absent for Cargo and for anything PAX
+    /// has no semantics for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<&'static str>,
 }
 
 impl ExecutionResult {
@@ -64,6 +69,7 @@ impl ExecutionResult {
             tool,
             exit_code,
             tests: None,
+            runner: None,
         }
     }
 }
@@ -202,8 +208,17 @@ fn run_native(
     Ok(child.wait()?.code())
 }
 
-fn execute_test(operation: &Operation, command: &RunCommand) -> ExecutionResult {
+fn execute_test(
+    operation: &Operation,
+    command: &RunCommand,
+    script: Option<&str>,
+) -> ExecutionResult {
     let tool = Some(execution_plan(command).tool);
+    if let Some(script) = script
+        && let Some(result) = execute_js_test(operation, command, script, tool.clone())
+    {
+        return result;
+    }
     let is_cargo_test =
         command.program == "cargo" && command.args.first().map(String::as_str) == Some("test");
     if is_cargo_test {
@@ -245,6 +260,303 @@ fn execute_test(operation: &Operation, command: &RunCommand) -> ExecutionResult 
             exit_code,
         ),
     }
+}
+
+// ---- JavaScript test runners ---------------------------------------------------------------------
+//
+// A package manager runs the project's `test` script; PAX cannot see inside it, so it reads the script
+// text, and only when that text is unambiguous. The runner must be the *last* command of the script (the
+// reporter options PAX adds are appended to the whole script, so they reach the last command), must be the
+// only runner named in it, and the script must not already choose a reporter or an output file. Anything
+// else is `interpretation-unsupported`, as before: PAX says nothing rather than guess.
+//
+// What is read, and where it comes from:
+//   * Vitest: `--reporter=json --outputFile=FILE` (Jest-compatible document).
+//   * Jest:   `--json --outputFile=FILE`.
+//   * `node --test`: `--test-reporter=tap`, whose closing `# tests/pass/fail/...` lines are read from stdout.
+// A result is only as good as its evidence: no document, a document PAX cannot parse strictly, or counts
+// that do not add up, is `no-runner-evidence`, never a pass.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JsRunner {
+    Vitest,
+    Jest,
+    NodeTest,
+}
+
+impl JsRunner {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vitest => "vitest",
+            Self::Jest => "jest",
+            Self::NodeTest => "node-test",
+        }
+    }
+}
+
+const WRAPPERS: [&str; 9] = [
+    "npx",
+    "pnpx",
+    "bunx",
+    "pnpm",
+    "yarn",
+    "npm",
+    "exec",
+    "dlx",
+    "cross-env",
+];
+
+/// The runner of the script's last command, or why there is none PAX will vouch for.
+pub(crate) fn classify_script(script: &str) -> Option<JsRunner> {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut rest = script;
+    while let Some(at) = rest.find(['&', '|', ';']) {
+        segments.push(&rest[..at]);
+        let step = if rest[at..].starts_with("&&") || rest[at..].starts_with("||") {
+            2
+        } else {
+            1
+        };
+        rest = &rest[at + step..];
+    }
+    segments.push(rest);
+    let runner_of = |segment: &str| -> Option<JsRunner> {
+        let mut tokens = segment.split_whitespace().peekable();
+        let mut found = None;
+        while let Some(token) = tokens.next() {
+            if token.contains('=') && !token.starts_with('-') {
+                continue; // an environment assignment
+            }
+            let base = token.rsplit('/').next().unwrap_or(token);
+            if WRAPPERS.contains(&base) {
+                continue;
+            }
+            found = match base {
+                "vitest" => Some(JsRunner::Vitest),
+                "jest" => Some(JsRunner::Jest),
+                "node" if segment.split_whitespace().any(|t| t == "--test") => {
+                    Some(JsRunner::NodeTest)
+                }
+                _ => None,
+            };
+            break;
+        }
+        found
+    };
+    let last = segments.last()?;
+    let runner = runner_of(last)?;
+    // Another runner anywhere before it makes the script ambiguous.
+    if segments[..segments.len() - 1]
+        .iter()
+        .any(|segment| runner_of(segment).is_some())
+    {
+        return None;
+    }
+    // The script must not already choose what PAX is about to choose.
+    let conflicts = [
+        "--reporter",
+        "--json",
+        "--outputFile",
+        "--output-file",
+        "--test-reporter",
+    ];
+    if last.split_whitespace().any(|t| {
+        conflicts
+            .iter()
+            .any(|c| t == *c || t.starts_with(&format!("{c}=")))
+    }) {
+        return None;
+    }
+    Some(runner)
+}
+
+/// What a JavaScript runner reported, before PAX decides what it means.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JsEvidence {
+    pub passed: u64,
+    pub failed: u64,
+    /// Skipped, pending and todo tests: known not to have run.
+    pub ignored: u64,
+    /// Suites or files that failed to load or run, which may contain no tests at all.
+    pub suite_failures: u64,
+    /// The runner's own overall verdict, where it states one.
+    pub success: Option<bool>,
+}
+
+fn count(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+/// A Jest-compatible JSON document (Jest `--json`, Vitest `--reporter=json`), read strictly: every count
+/// must be present and the test counts must add up.
+pub(crate) fn parse_jest_json(text: &str) -> Option<JsEvidence> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let total = count(&value, "numTotalTests")?;
+    let passed = count(&value, "numPassedTests")?;
+    let failed = count(&value, "numFailedTests")?;
+    let pending = count(&value, "numPendingTests")?;
+    let todo = count(&value, "numTodoTests").unwrap_or(0);
+    if passed + failed + pending + todo != total {
+        return None;
+    }
+    let suite_failures = count(&value, "numFailedTestSuites")?
+        + count(&value, "numRuntimeErrorTestSuites").unwrap_or(0);
+    Some(JsEvidence {
+        passed,
+        failed,
+        ignored: pending + todo,
+        suite_failures,
+        success: Some(value.get("success")?.as_bool()?),
+    })
+}
+
+/// The closing summary of Node's TAP reporter: `# tests N`, `# pass N`, `# fail N`, `# cancelled N`,
+/// `# skipped N`, `# todo N`. Every one must be seen once and they must add up.
+#[derive(Debug, Default)]
+pub(crate) struct TapSummary {
+    seen: [Option<u64>; 6],
+    malformed: bool,
+}
+
+impl TapSummary {
+    const LABELS: [&'static str; 6] = ["tests", "pass", "fail", "cancelled", "skipped", "todo"];
+
+    pub(crate) fn observe_line(&mut self, line: &str) {
+        let Some(rest) = line.strip_prefix("# ") else {
+            return;
+        };
+        let Some((label, number)) = rest.split_once(' ') else {
+            return;
+        };
+        let Some(slot) = Self::LABELS.iter().position(|l| *l == label) else {
+            return;
+        };
+        match number.trim().parse::<u64>() {
+            Ok(n) if self.seen[slot].is_none() => self.seen[slot] = Some(n),
+            _ => self.malformed = true,
+        }
+    }
+
+    pub(crate) fn evidence(&self) -> Option<JsEvidence> {
+        if self.malformed {
+            return None;
+        }
+        let [total, pass, fail, cancelled, skipped, todo] = self.seen;
+        let (total, pass, fail, cancelled, skipped, todo) =
+            (total?, pass?, fail?, cancelled?, skipped?, todo?);
+        if pass + fail + cancelled + skipped + todo != total {
+            return None;
+        }
+        Some(JsEvidence {
+            passed: pass,
+            failed: fail + cancelled,
+            ignored: skipped + todo,
+            suite_failures: 0,
+            success: None,
+        })
+    }
+}
+
+pub(crate) fn interpret_js_test(
+    exit_code: Option<i32>,
+    evidence: Option<JsEvidence>,
+) -> (Status, &'static str, Option<TestCounts>) {
+    let counts = evidence.map(|e| TestCounts {
+        passed: e.passed,
+        failed: e.failed,
+        ignored: e.ignored,
+        measured: 0,
+    });
+    let Some(e) = evidence else {
+        return match exit_code {
+            None => (Status::Failed, "terminated-by-signal", None),
+            Some(code) if code != 0 => (Status::Failed, "native-exit-nonzero", None),
+            Some(_) => (Status::Unsupported, "no-runner-evidence", None),
+        };
+    };
+    if e.failed > 0 {
+        return (Status::Failed, "tests-failed", counts);
+    }
+    if e.suite_failures > 0 || e.success == Some(false) {
+        return (Status::Failed, "test-suite-failed", counts);
+    }
+    match exit_code {
+        None => (Status::Failed, "terminated-by-signal", counts),
+        Some(code) if code != 0 => (Status::Failed, "native-exit-nonzero", counts),
+        Some(_) if e.passed == 0 => (Status::NotRun, "no-tests-executed", counts),
+        Some(_) => (Status::Passed, "tests-passed", counts),
+    }
+}
+
+/// The package manager's own way of passing arguments to a script: npm needs `--` first.
+fn with_script_args(command: &RunCommand, extra: &[String]) -> Vec<String> {
+    let mut args = command.args.clone();
+    if command.program == "npm" && !args.iter().any(|a| a == "--") {
+        args.push("--".to_string());
+    }
+    args.extend(extra.iter().cloned());
+    args
+}
+
+fn report_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("pax-js-{}-{nanos}.json", std::process::id()))
+}
+
+/// The most of a runner's JSON document PAX will read.
+const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Runs the project's `test` script with a machine-readable reporter, when its runner is one PAX can read.
+/// `None` means PAX has no semantics for this script and the caller runs it as it always has.
+fn execute_js_test(
+    operation: &Operation,
+    command: &RunCommand,
+    script: &str,
+    tool: Option<String>,
+) -> Option<ExecutionResult> {
+    let runner = classify_script(script)?;
+    let output = report_path();
+    let reporter: Vec<String> = match runner {
+        JsRunner::Vitest => vec![
+            "--reporter=json".into(),
+            format!("--outputFile={}", output.display()),
+        ],
+        JsRunner::Jest => vec![
+            "--json".into(),
+            format!("--outputFile={}", output.display()),
+        ],
+        JsRunner::NodeTest => vec!["--test-reporter=tap".into()],
+    };
+    let args = with_script_args(command, &reporter);
+    let mut tap = TapSummary::default();
+    let outcome = run_native(command, &args, |line| {
+        if runner == JsRunner::NodeTest {
+            tap.observe_line(line);
+        }
+        false
+    });
+    let evidence = match runner {
+        JsRunner::NodeTest => tap.evidence(),
+        _ => std::fs::metadata(&output)
+            .ok()
+            .filter(|meta| meta.is_file() && meta.len() <= MAX_REPORT_BYTES)
+            .and_then(|_| std::fs::read_to_string(&output).ok())
+            .and_then(|text| parse_jest_json(&text)),
+    };
+    let _ = std::fs::remove_file(&output);
+    Some(match outcome {
+        Err(error) => native_error(operation, tool, &error),
+        Ok(exit_code) => {
+            let (status, reason, tests) = interpret_js_test(exit_code, evidence);
+            let mut result = ExecutionResult::new(operation, status, reason, tool, exit_code);
+            result.tests = tests;
+            result.runner = Some(runner.name());
+            result
+        }
+    })
 }
 
 fn native_error(
@@ -330,7 +642,20 @@ pub(crate) fn execute_with_result(
             );
         }
     };
-    let result = execute_test(&resolved.operation, &resolved.command);
+    // The text of the package.json `test` script, when the resolved command runs it
+    // through a package manager: the only thing PAX can read a JavaScript runner from.
+    let script = (matches!(resolved.operation, Operation::Test)
+        && PackageManager::parse(&resolved.command.program).is_some()
+        && resolved.command.args.first().map(String::as_str) == Some("run")
+        && resolved.command.args.get(1).map(String::as_str) == Some("test"))
+    .then(|| {
+        detection
+            .package_json_data
+            .as_ref()
+            .and_then(|data| data.scripts.get("test").cloned())
+    })
+    .flatten();
+    let result = execute_test(&resolved.operation, &resolved.command, script.as_deref());
     emit(&result, 1)
 }
 
@@ -442,6 +767,185 @@ mod tests {
         e.observe_cargo_message(&serde_json::json!({"reason":"build-finished","success":false}));
         assert_eq!(e.test_executables, 1);
         assert_eq!(e.build_success, Some(false));
+    }
+
+    // ---- JavaScript runners -------------------------------------------------------------------
+
+    const VITEST_JSON: &str = r#"{"numTotalTestSuites":2,"numPassedTestSuites":2,"numFailedTestSuites":0,"numPendingTestSuites":0,"numTotalTests":4,"numPassedTests":3,"numFailedTests":0,"numPendingTests":1,"numTodoTests":0,"startTime":1,"success":true,"testResults":[]}"#;
+
+    #[test]
+    fn the_last_command_of_the_script_names_the_runner_and_ambiguity_is_refused() {
+        for (script, want) in [
+            ("vitest run", Some(JsRunner::Vitest)),
+            ("vitest", Some(JsRunner::Vitest)),
+            ("npx vitest run --coverage", Some(JsRunner::Vitest)),
+            ("pnpm exec vitest run", Some(JsRunner::Vitest)),
+            ("CI=1 jest --ci", Some(JsRunner::Jest)),
+            ("cross-env NODE_ENV=test jest", Some(JsRunner::Jest)),
+            ("tsc --noEmit && vitest run", Some(JsRunner::Vitest)),
+            ("node --test", Some(JsRunner::NodeTest)),
+            ("node --test test/", Some(JsRunner::NodeTest)),
+            // the runner is not last: the reporter options would reach something else
+            ("vitest run && eslint .", None),
+            // two runners
+            ("jest && vitest run", None),
+            // not a runner, or no runner
+            ("mocha", None),
+            ("echo vitest", None),
+            ("node build.js", None),
+            ("true", None),
+            // the script already chooses a reporter or an output file
+            ("vitest run --reporter=verbose", None),
+            ("jest --json", None),
+            ("jest --outputFile=out.json", None),
+            ("node --test --test-reporter=spec", None),
+        ] {
+            assert_eq!(classify_script(script), want, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_jest_compatible_document_is_read_strictly() {
+        let e = parse_jest_json(VITEST_JSON).unwrap();
+        assert_eq!(
+            (e.passed, e.failed, e.ignored, e.suite_failures),
+            (3, 0, 1, 0)
+        );
+        assert_eq!(e.success, Some(true));
+        // counts that do not add up, a missing count, or no document at all
+        for bad in [
+            VITEST_JSON.replace("\"numTotalTests\":4", "\"numTotalTests\":5"),
+            VITEST_JSON.replace("\"numPassedTests\":3,", ""),
+            VITEST_JSON.replace("\"success\":true", "\"success\":\"yes\""),
+            "not json".to_string(),
+            "{}".to_string(),
+        ] {
+            assert!(parse_jest_json(&bad).is_none(), "{bad}");
+        }
+        // todo tests count as not run, and a runtime-error suite is a suite failure
+        let with_todo = VITEST_JSON
+            .replace("\"numTodoTests\":0", "\"numTodoTests\":2")
+            .replace("\"numTotalTests\":4", "\"numTotalTests\":6");
+        assert_eq!(parse_jest_json(&with_todo).unwrap().ignored, 3);
+        let runtime = VITEST_JSON.replace(
+            "\"numFailedTestSuites\":0",
+            "\"numFailedTestSuites\":0,\"numRuntimeErrorTestSuites\":1",
+        );
+        assert_eq!(parse_jest_json(&runtime).unwrap().suite_failures, 1);
+    }
+
+    #[test]
+    fn node_tap_summary_needs_every_line_once_and_they_must_add_up() {
+        let lines = [
+            "# tests 3",
+            "# suites 0",
+            "# pass 1",
+            "# fail 1",
+            "# cancelled 0",
+            "# skipped 1",
+            "# todo 0",
+            "# duration_ms 38.5",
+        ];
+        let mut tap = TapSummary::default();
+        lines.iter().for_each(|l| tap.observe_line(l));
+        let e = tap.evidence().unwrap();
+        assert_eq!((e.passed, e.failed, e.ignored), (1, 1, 1));
+        // a missing line, a repeated line, a mismatch, and a cancelled test counting as a failure
+        let mut missing = TapSummary::default();
+        lines[..5].iter().for_each(|l| missing.observe_line(l));
+        assert!(missing.evidence().is_none());
+        let mut repeated = TapSummary::default();
+        lines
+            .iter()
+            .chain(["# pass 1"].iter())
+            .for_each(|l| repeated.observe_line(l));
+        assert!(repeated.evidence().is_none());
+        let mut off = TapSummary::default();
+        lines
+            .iter()
+            .map(|l| l.replace("# tests 3", "# tests 4"))
+            .for_each(|l| off.observe_line(&l));
+        assert!(off.evidence().is_none());
+        let mut cancelled = TapSummary::default();
+        [
+            "# tests 2",
+            "# pass 1",
+            "# fail 0",
+            "# cancelled 1",
+            "# skipped 0",
+            "# todo 0",
+        ]
+        .iter()
+        .for_each(|l| cancelled.observe_line(l));
+        assert_eq!(cancelled.evidence().unwrap().failed, 1);
+    }
+
+    fn ev(
+        passed: u64,
+        failed: u64,
+        ignored: u64,
+        suites: u64,
+        success: Option<bool>,
+    ) -> Option<JsEvidence> {
+        Some(JsEvidence {
+            passed,
+            failed,
+            ignored,
+            suite_failures: suites,
+            success,
+        })
+    }
+
+    #[test]
+    fn js_exit_zero_is_not_a_pass_without_evidence_that_tests_ran() {
+        let status = |exit, e| {
+            let (s, r, _) = interpret_js_test(exit, e);
+            (s, r)
+        };
+        assert_eq!(
+            status(Some(0), ev(3, 0, 1, 0, Some(true))),
+            (Status::Passed, "tests-passed")
+        );
+        // no document, or one PAX could not read
+        assert_eq!(
+            status(Some(0), None),
+            (Status::Unsupported, "no-runner-evidence")
+        );
+        // nothing executed
+        assert_eq!(
+            status(Some(0), ev(0, 0, 2, 0, Some(true))),
+            (Status::NotRun, "no-tests-executed")
+        );
+        assert_eq!(
+            status(Some(0), ev(0, 0, 0, 0, Some(true))),
+            (Status::NotRun, "no-tests-executed")
+        );
+        // a failing test wins over exit 0; so does a suite that failed to load (it holds no tests)
+        assert_eq!(
+            status(Some(0), ev(3, 1, 0, 0, None)),
+            (Status::Failed, "tests-failed")
+        );
+        assert_eq!(
+            status(Some(0), ev(3, 0, 0, 1, Some(true))),
+            (Status::Failed, "test-suite-failed")
+        );
+        assert_eq!(
+            status(Some(0), ev(3, 0, 0, 0, Some(false))),
+            (Status::Failed, "test-suite-failed")
+        );
+        // a nonzero exit is a failure even when every counted test passed
+        assert_eq!(
+            status(Some(1), ev(3, 0, 0, 0, Some(true))),
+            (Status::Failed, "native-exit-nonzero")
+        );
+        assert_eq!(
+            status(Some(2), None),
+            (Status::Failed, "native-exit-nonzero")
+        );
+        assert_eq!(
+            status(None, ev(3, 0, 0, 0, None)),
+            (Status::Failed, "terminated-by-signal")
+        );
     }
 
     #[test]

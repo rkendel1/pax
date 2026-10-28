@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `pax --json test` now reads the result of JavaScript test runners: Vitest and Jest (JSON reporter
+  document) and `node --test` (TAP summary), when the `test` script's last command is one of them.
+  New `runner` field and reasons `test-suite-failed` and `no-runner-evidence`; other scripts remain
+  `interpretation-unsupported`. See README, "JavaScript runners".
+
 ## 0.5.0
 
 - add the canonical observation contract (`pax.contract.v1`): versioned
